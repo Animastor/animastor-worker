@@ -1,0 +1,750 @@
+// ======================================================
+// GPU Worker - v2.1.1 (fail-closed authorization, PW-4)
+// ======================================================
+// CJS (CommonJS) — Node 18+ with global fetch is assumed.
+// Job Protocol v2 comes from the GENERATED copy of the canonical
+// @animastor/contracts package (Phase 9D, blocker B2 — option B):
+//   packages/animastor-worker/worker/job-protocol-v2.cjs  (regenerate: node packages/animastor-worker/tools/sync-protocol.cjs)
+// It is byte-parity guarded against the canonical source — never edit it.
+
+const { execSync } = require("child_process");
+const os = require("os");
+const fs = require("fs");
+const fsp = require("fs").promises;
+const path = require("path");
+const { cleanupJobArtifacts } = require("./worker-cleanup.cjs");
+const journal = require("./worker-cleanup-journal.cjs");
+const { loadDotEnv } = require("./worker-env.cjs");
+const { PROTOCOL_VERSION, JOB_ID_SPLIT_RE } = require("./job-protocol-v2.cjs");
+
+// Bundle self-containment: load ./.env next to the worker (cp .env.example
+// .env). Real environment variables always win over the file.
+loadDotEnv(__dirname);
+
+// ======================================================
+// CONFIG
+// ======================================================
+
+const HUB_URL = process.env.HUB_URL || "https://animastor.in/gpu";
+const COMFY_PORT = process.env.COMFY_PORT || 8188;
+const WORKER_TYPE = process.env.WORKER_TYPE || "image";
+
+// PW-4 (FAIL CLOSED): the worker credential (`wrk.<worker_id>.<secret>`,
+// issued once at registration in Animastor) is REQUIRED. Every hub call
+// carries `Authorization: Bearer <token>` and the hub derives identity,
+// workspace and MODE from the registry — the worker never chooses its own
+// mode. No credential → the worker refuses to start: a missing credential
+// must never silently become a system/share worker.
+const ANIMASTOR_WORKER_TOKEN = process.env.ANIMASTOR_WORKER_TOKEN || null;
+
+// Backend API base for the startup credential verification. Derived from
+// HUB_URL by default (…/gpu → …/api/v1); override with ANIMASTOR_API_URL.
+const ANIMASTOR_API_URL = process.env.ANIMASTOR_API_URL
+  || HUB_URL.replace(/\/gpu\/?$/, "") + "/api/v1";
+
+const NOTEBOOK_PATH = process.env.NOTEBOOK_PATH || "";
+const WORKER_ID = process.env.WORKER_ID || "gpu-" + os.hostname();
+// Canonical bundle version lives in ./package.json (the hub publishes the
+// same value with the worker-bundle artifact). WORKER_VERSION env overrides.
+function readBundleVersion() {
+  try { return require("./package.json").version || null; } catch (_) { return null; }
+}
+const WORKER_VERSION = process.env.WORKER_VERSION || readBundleVersion();
+const WORKER_IMAGE_TAG = process.env.WORKER_IMAGE_TAG || null;
+// PROTOCOL_VERSION comes from the generated copy of @animastor/contracts
+// (top of file) — the frozen Job Protocol v2 value (2) lives there only.
+
+const RESULT_TIMEOUT_MS = Number(process.env.RESULT_TIMEOUT_MS || 600000);
+// Видео-генерация длинная по своей природе (LTX: 5-10 мин, на слабом GPU —
+// 20-30+ мин). Дефолт для видео НЕ может быть 10 мин — иначе нормальная
+// долгая генерация убивается как timeout. Приоритет: task.timeout_ms
+// (приходит от backend через gpu-hub, layer-config per-type timeout);
+// fallback для видео — 2 часа (реальный потолок — dispatch-lease backend'а).
+const VIDEO_RESULT_TIMEOUT_MS = Number(process.env.VIDEO_RESULT_TIMEOUT_MS || 7200000);
+const TASK_SLEEP_MS = Number(process.env.TASK_SLEEP_MS || 2000);
+const BEACON_INTERVAL_MS = Number(process.env.BEACON_INTERVAL_MS || 10000);
+
+const COMFY_INPUT_DIR = process.env.COMFY_INPUT_DIR || "/home/jovyan/ComfyUI/input";
+const COMFY_OUTPUT_DIR = path.resolve(COMFY_INPUT_DIR, "../output");
+
+// ======================================================
+// UTILS
+// ======================================================
+
+function log(level, msg, data) {
+  console.log(`[${new Date().toISOString()}] [${level}] ${msg}`);
+  if (data !== undefined) console.log(typeof data === 'string' ? data : JSON.stringify(data, null, 2));
+}
+
+function sleep(ms) {
+  return new Promise(r => setTimeout(r, ms));
+}
+
+async function fetchTimeout(url, options = {}, timeout = 30000) {
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort(), timeout);
+
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(id);
+  }
+}
+
+function comfyUrl(p) {
+  return `http://127.0.0.1:${COMFY_PORT}${NOTEBOOK_PATH}${p}`;
+}
+
+// PW-4: hub request headers — always Bearer-authenticated (the startup gate
+// guarantees a credential is present; defense-in-depth keeps it unconditional).
+function hubHeaders() {
+  const headers = { "Content-Type": "application/json" };
+  if (ANIMASTOR_WORKER_TOKEN) headers["Authorization"] = `Bearer ${ANIMASTOR_WORKER_TOKEN}`;
+  return headers;
+}
+
+// FAIL CLOSED: an auth rejection from the hub/backend is terminal. Retrying
+// an invalid credential forever would only hide the misconfiguration — the
+// operator must fix ANIMASTOR_WORKER_TOKEN.
+function authFailed(source, status) {
+  log("error", "Worker authentication failed — check ANIMASTOR_WORKER_TOKEN");
+  log("error", `${source} rejected the credential (HTTP ${status}). The token may be wrong, rotated or revoked.`);
+  log("error", "Create/rotate a worker in Animastor (Settings → Workers) and set the new token.");
+  process.exit(1);
+}
+
+// ======================================================
+// STARTUP CREDENTIAL VERIFICATION
+// ======================================================
+// The registry is the source of truth: the worker learns its identity and
+// mode from the backend (POST /api/v1/worker/verify). It never decides for
+// itself whether it is private/share/system — it only confirms.
+
+async function verifyCredential() {
+  let res;
+  try {
+    res = await fetchTimeout(`${ANIMASTOR_API_URL}/worker/verify`, {
+      method: "POST",
+      headers: hubHeaders(),
+      body: JSON.stringify({})
+    });
+  } catch (err) {
+    // Network failure — the backend may be temporarily down. The hub still
+    // enforces the credential on every call, so warn and continue.
+    log("warn", `Credential verification unavailable (${err.message}) — continuing, the hub will enforce auth`);
+    return;
+  }
+  if (res.status === 401 || res.status === 403) {
+    authFailed("Animastor backend", res.status);
+    return;
+  }
+  if (!res.ok) {
+    log("warn", `Credential verification returned HTTP ${res.status} — continuing, the hub will enforce auth`);
+    return;
+  }
+  try {
+    const data = await res.json();
+    log("info", "✓ Credential accepted");
+    if (data.workspace_name) log("info", `✓ Workspace: ${data.workspace_name}`);
+    log("info", `✓ Mode: ${String(data.mode || "").toUpperCase()}`);
+    log("info", `✓ Worker type (registry): ${data.worker_type}`);
+    if (data.worker_type && data.worker_type !== WORKER_TYPE) {
+      log("warn", `WORKER_TYPE=${WORKER_TYPE} differs from the registry type ${data.worker_type} — the registry wins at the hub`);
+    }
+  } catch (_) { /* cosmetic only */ }
+}
+
+// ======================================================
+// FIND OUTPUT NODES (Save*)
+// ======================================================
+
+function findOutputNodes(workflow) {
+  const result = { image: [], audio: [], video: [] };
+
+  for (const [id, node] of Object.entries(workflow || {})) {
+    const type = node.class_type || "";
+
+    if (type.startsWith("SaveImage")) result.image.push(id);
+    if (type.startsWith("SaveAudio")) result.audio.push(id);
+    if (type.startsWith("SaveVideo") || type.startsWith("CreateVideo")) result.video.push(id);
+  }
+
+  return result;
+}
+
+// ======================================================
+// GPU INFO
+// ======================================================
+
+function getGPUInfo() {
+  try {
+    const gpu = execSync(
+      "nvidia-smi --query-gpu=name,memory.total --format=csv,noheader"
+    ).toString().trim();
+
+    const [name, vram] = gpu.split(",");
+    return { name: name.trim(), vram: vram.trim() };
+  } catch (err) {
+    log("error", "nvidia-smi failed", err.message);
+    return { name: "unknown", vram: "unknown" };
+  }
+}
+
+// ======================================================
+// WAIT COMFY with exponential backoff
+// ======================================================
+
+async function waitForComfyUI() {
+  log("info", "Waiting for ComfyUI");
+  let attempts = 0;
+
+  while (true) {
+    try {
+      const res = await fetchTimeout(comfyUrl("/system_stats"));
+      if (res.ok) {
+        log("info", "ComfyUI ready");
+        await sleep(3000);
+        return;
+      }
+    } catch (err) {
+      log("warn", `ComfyUI not ready (attempt ${attempts + 1}): ${err.message}`);
+    }
+
+    attempts++;
+    const backoff = Math.min(1000 * (1 << Math.min(attempts, 5)), 30000);
+    process.stdout.write(".");
+    await sleep(backoff);
+  }
+}
+
+// ======================================================
+// BEACON
+// ======================================================
+
+async function sendBeacon() {
+  try {
+    const gpu = getGPUInfo();
+
+    const res = await fetchTimeout(`${HUB_URL}/beacon`, {
+      method: "POST",
+      headers: hubHeaders(),
+      body: JSON.stringify({
+        id: WORKER_ID,
+        type: WORKER_TYPE,
+        gpu: gpu.name,
+        vram: gpu.vram,
+        version: WORKER_VERSION,
+        image_tag: WORKER_IMAGE_TAG,
+        protocol_version: PROTOCOL_VERSION
+      })
+    });
+    if (res.status === 401 || res.status === 403) {
+      authFailed("GPU hub /beacon", res.status);
+      return;
+    }
+    if (!res.ok) {
+      throw new Error(`Hub rejected beacon: HTTP ${res.status}`);
+    }
+  } catch (err) {
+    log("error", "Beacon failed", err.message);
+  }
+}
+
+// ======================================================
+// GET TASK with backoff
+// ======================================================
+
+async function getTask() {
+  try {
+    const res = await fetchTimeout(
+      `${HUB_URL}/task/next?worker=${WORKER_ID}&type=${WORKER_TYPE}`,
+      { headers: hubHeaders() }
+    );
+
+    if (res.status === 401 || res.status === 403) {
+      authFailed("GPU hub /task/next", res.status);
+      return null;
+    }
+    if (!res.ok) return null;
+
+    const data = await res.json();
+    return data?.task || null;
+
+  } catch (err) {
+    log("warn", "getTask failed", err.message);
+    return null;
+  }
+}
+
+// ======================================================
+// SAVE IMAGE (async)
+// ======================================================
+
+async function saveBase64ImageSafe(base64, filename) {
+  const clean = base64.includes(",") ? base64.split(",")[1] : base64;
+  const buffer = Buffer.from(clean, "base64");
+
+  await fsp.mkdir(COMFY_INPUT_DIR, { recursive: true }).catch(err => log("warn", "mkdir", err.message));
+
+  const filePath = path.join(COMFY_INPUT_DIR, filename);
+  await fsp.writeFile(filePath, buffer);
+
+  return { path: filePath, expectedSize: buffer.length };
+}
+
+// ======================================================
+// WAIT FILE READY
+// ======================================================
+
+async function waitForFileReady(filePath, expectedSize, timeout = 5000) {
+  const start = Date.now();
+
+  while (true) {
+    if (Date.now() - start > timeout) {
+      throw new Error(`File not ready: ${filePath}`);
+    }
+
+    try {
+      await fsp.access(filePath);
+      const stats = await fsp.stat(filePath);
+      if (stats.size === expectedSize && stats.size > 0) {
+        await sleep(50);
+        return true;
+      }
+    } catch (err) {
+      log("warn", `waitForFileReady error`, err.message);
+    }
+
+    await sleep(100);
+  }
+}
+
+// ======================================================
+// RUN WORKFLOW
+// ======================================================
+
+async function runWorkflow(workflow) {
+  const body = workflow?.prompt
+    ? { ...workflow, client_id: WORKER_ID }
+    : { prompt: workflow, client_id: WORKER_ID };
+
+  const res = await fetchTimeout(
+    comfyUrl("/prompt"),
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body)
+    }
+  );
+
+  const text = await res.text();
+
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    throw new Error("Invalid JSON from ComfyUI: " + text.slice(0, 500));
+  }
+
+  if (!data.prompt_id) {
+    log("error", "ComfyUI error", data);
+    throw new Error("No prompt_id");
+  }
+
+  return data.prompt_id;
+}
+
+// ======================================================
+// WAIT RESULT (with backoff)
+// ======================================================
+
+async function waitResult(prompt_id, workflow, timeoutMs) {
+  const start = Date.now();
+  const outputsMap = findOutputNodes(workflow);
+  const isVideoJob = outputsMap.video.length > 0;
+  const effectiveTimeoutMs = timeoutMs || (isVideoJob ? VIDEO_RESULT_TIMEOUT_MS : RESULT_TIMEOUT_MS);
+  log("debug", `waitResult: ${isVideoJob ? 'video' : 'other'} prompt=${prompt_id} timeoutMs=${effectiveTimeoutMs} (task.timeout_ms=${timeoutMs || 'none'})`);
+
+  let videoDir, beforeFiles, videoPrefix;
+  if (isVideoJob) {
+    videoDir = path.join(COMFY_OUTPUT_DIR, 'video');
+    try {
+      beforeFiles = new Set((await fsp.readdir(videoDir)).filter(f => f.endsWith('.mp4')));
+    } catch (err) {
+      log("warn", "waitResult readdir", err && err.message || err);
+      beforeFiles = new Set();
+    }
+    for (const id of outputsMap.video) {
+      const prefix = workflow?.[id]?.inputs?.filename_prefix;
+      if (prefix) {
+        videoPrefix = path.basename(prefix);
+        break;
+      }
+    }
+  }
+
+  let pollDelay = 500;
+  while (true) {
+    if (Date.now() - start > effectiveTimeoutMs) {
+      try {
+        const res = await fetchTimeout(comfyUrl(`/history/${prompt_id}`));
+        const d = await res.json();
+        log("error", `Timeout after ${Math.round(effectiveTimeoutMs / 60000)}min: last history response`, JSON.stringify(d).slice(0, 2000));
+      } catch (err) {
+        log("error", "Timeout: failed to fetch history", err.message);
+      }
+      throw new Error(`Timeout waiting result (${Math.round(effectiveTimeoutMs / 60000)}min)`);
+    }
+
+    try {
+      const res = await fetchTimeout(comfyUrl(`/history/${prompt_id}`));
+      const data = await res.json();
+      const outputs = data?.[prompt_id]?.outputs || {};
+
+      for (const id of outputsMap.image) {
+        const node = outputs[id];
+        if (node?.images?.length > 0) return { type: "image", meta: node.images[0] };
+      }
+
+      for (const id of outputsMap.audio) {
+        const node = outputs[id];
+        if (node?.audio) {
+          const a = Array.isArray(node.audio) ? node.audio[0] : node.audio;
+          if (a?.filename) return { type: "audio", meta: a };
+          if (a?.data || typeof a === "string") return { type: "audio_base64", data: a.data || a };
+        }
+      }
+
+      if (isVideoJob) {
+        for (const id of outputsMap.video) {
+          const node = outputs[id];
+          for (const key of ['videos', 'video', 'gifs', 'result', 'files', 'media']) {
+            const arr = node?.[key];
+            if (Array.isArray(arr) && arr[0]?.filename) {
+              return { type: "video", meta: arr[0] };
+            }
+          }
+        }
+
+        for (const node of Object.values(outputs)) {
+          for (const arr of Object.values(node || {})) {
+            if (Array.isArray(arr) && arr[0]?.filename?.endsWith('.mp4')) {
+              return { type: "video", meta: arr[0] };
+            }
+          }
+        }
+
+        if (data?.[prompt_id]?.status?.completed && videoDir) {
+          const allFiles = await fsp.readdir(videoDir).catch(() => []);
+          const mp4Files = allFiles.filter(f => f.endsWith('.mp4'));
+          const newFiles = mp4Files.filter(f => !beforeFiles.has(f));
+          const matched = videoPrefix
+            ? newFiles.filter(f => f.startsWith(videoPrefix))
+            : newFiles;
+          if (matched.length > 0) {
+            const newest = matched.sort().pop();
+            log("info", `FS video: ${newest}`);
+            return { type: "video", meta: { filename: newest, subfolder: 'video', type: 'output' } };
+          }
+        }
+      }
+
+      // Reset poll delay on successful response
+      pollDelay = 500;
+    } catch (err) {
+      log("warn", "waitResult poll failed", err.message);
+      // Exponential backoff on error: 1s → 2s → 4s → 8s cap
+      pollDelay = Math.min(pollDelay * 2, 8000);
+    }
+
+    await sleep(pollDelay);
+  }
+}
+
+// ======================================================
+// DOWNLOAD RESULT (OOM-safe: читаем с диска, не через HTTP re-download)
+// ======================================================
+// ComfyUI уже сохранил результат на диск в COMFY_OUTPUT_DIR.
+// Вместо повторного HTTP download (который держит 2x файл в памяти:
+// arrayBuffer + base64), читаем локально.
+// Для файлов > 50MB логируем предупреждение — они всё равно будут
+// загружены в память как base64 (protocol limitation).
+
+const MIME_MAP = {
+  '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp',
+  '.mp3': 'audio/mp3', '.wav': 'audio/wav', '.ogg': 'audio/ogg', '.flac': 'audio/flac',
+  '.mp4': 'video/mp4', '.webm': 'video/webm', '.avi': 'video/avi', '.mov': 'video/quicktime',
+};
+
+async function downloadResult(result) {
+  if (result.type === "audio_base64") {
+    return `data:audio/mp3;base64,${result.data}`;
+  }
+
+  const f = result.meta;
+  const filename = f.filename;
+  const subfolder = f.subfolder || "";
+  const ext = path.extname(filename).toLowerCase();
+  const mime = MIME_MAP[ext] || 'application/octet-stream';
+
+  // ── Try local filesystem first (OOM-safe, no HTTP overhead) ──
+  const localPath = path.resolve(COMFY_OUTPUT_DIR, subfolder, filename);
+  try {
+    const stat = await fsp.stat(localPath).catch(() => null);
+    if (stat && stat.isFile() && stat.size > 0) {
+      if (stat.size > 50 * 1024 * 1024) {
+        log("warn", `Large file (${(stat.size / 1024 / 1024).toFixed(1)}MB) — base64 will use significant memory: ${filename}`);
+      }
+      const buffer = await fsp.readFile(localPath);
+      return `data:${mime};base64,${buffer.toString('base64')}`;
+    }
+  } catch (_) {}
+
+  // ── Fallback: HTTP download from ComfyUI ──
+  log("info", `Falling back to HTTP download for ${filename}`);
+  let sf = subfolder;
+  if (sf.includes("/")) sf = sf.split("/")[0];
+
+  const url = comfyUrl(
+    `/view?filename=${encodeURIComponent(filename)}&subfolder=${encodeURIComponent(sf)}&type=output`
+  );
+
+  const res = await fetchTimeout(url);
+  if (!res.ok) throw new Error("Download failed: " + res.status);
+
+  const buffer = await res.arrayBuffer();
+  const raw = Buffer.from(buffer).toString("base64");
+
+  return `data:${mime};base64,${raw}`;
+}
+
+// ======================================================
+// SEND RESULT
+// ======================================================
+
+async function sendResult(task, data) {
+  const { job_id, build_id, dispatch_id } = task;
+  const res = await fetchTimeout(`${HUB_URL}/task/result`, {
+    method: "POST",
+    headers: hubHeaders(),
+    body: JSON.stringify({
+      job_id,
+      build_id,
+      dispatch_id,
+      protocol_version: PROTOCOL_VERSION,
+      result_base64: data,
+      worker_version: WORKER_VERSION,
+      worker_image_tag: WORKER_IMAGE_TAG
+    })
+  });
+  if (!res.ok) {
+    throw new Error(`Hub rejected result: HTTP ${res.status}`);
+  }
+}
+
+async function sendTaskError(task, reason) {
+  const res = await fetchTimeout(`${HUB_URL}/task/error`, {
+    method: "POST",
+    headers: hubHeaders(),
+    body: JSON.stringify({
+      job_id: task.job_id,
+      build_id: task.build_id || null,
+      dispatch_id: task.dispatch_id,
+      protocol_version: PROTOCOL_VERSION,
+      reason: String(reason || "worker_error").slice(0, 500),
+      worker_version: WORKER_VERSION,
+      worker_image_tag: WORKER_IMAGE_TAG
+    })
+  });
+  if (!res.ok) {
+    throw new Error(`Hub rejected task error: HTTP ${res.status}`);
+  }
+}
+
+// ======================================================
+// LOOP (with backoff on empty queue)
+// ======================================================
+
+let emptyQueueDelay = TASK_SLEEP_MS;
+
+async function workerLoop() {
+  setInterval(sendBeacon, BEACON_INTERVAL_MS);
+
+  while (true) {
+    const task = await getTask();
+
+    if (!task) {
+      await sleep(emptyQueueDelay);
+      emptyQueueDelay = Math.min(emptyQueueDelay * 2, 15000);
+      continue;
+    }
+    emptyQueueDelay = TASK_SLEEP_MS; // reset on task received
+
+    log("info", `Task ${task.job_id} (type=${WORKER_TYPE}, timeout_ms=${task.timeout_ms || 'default'})`);
+
+    if (task.protocol_version !== PROTOCOL_VERSION || !task.dispatch_id) {
+      const reason = `incompatible_task_protocol:${task.protocol_version || 'missing'}`;
+      log("error", `Rejecting incompatible task: protocol=${task.protocol_version}, dispatch=${task.dispatch_id || 'missing'}`);
+      if (task.job_id && task.build_id && task.dispatch_id) {
+        try {
+          await sendTaskError(task, reason);
+        } catch (sendErr) {
+          log("error", "Failed to report incompatible task", sendErr.message);
+        }
+      }
+      await sleep(TASK_SLEEP_MS);
+      continue;
+    }
+
+    // ── Per-job artifact tracking (cleanup after job) ──
+    // Точечная уборка: удаляются ТОЛЬКО файлы этой job. Output удаляется
+    // только после успешной доставки результата (downloadResult + sendResult),
+    // чтобы при ошибке sendResult() единственный результат не потерялся.
+    // Journal (worker-local persistent) фиксирует lifecycle
+    // CREATED→GENERATED→DELIVERED→CLEANED, чтобы после crash restart мог
+    // дочистить файлы job, результат которой уже доставлен в hub.
+    const createdInputFiles = [];
+    let outputPath = null;
+    let outputDelivered = false;
+    const jobId = task.job_id;
+    const dispatchId = task.dispatch_id;
+
+    try {
+      // Journal: CREATED — создаётся ДО первого временного input-файла.
+      await journal.createJob({ jobId, dispatchId, log });
+
+      if (task.assets?.images) {
+        const [jobBase] = task.job_id.split(JOB_ID_SPLIT_RE);
+        const scenePrefix = jobBase.replace(/_g\d+$/, '');
+        for (const [unitId, base64] of Object.entries(task.assets.images)) {
+          const filename = `${scenePrefix}_${unitId}.png`;
+          const filePath = path.join(COMFY_INPUT_DIR, filename);
+          createdInputFiles.push(filePath);
+          const { expectedSize } = await saveBase64ImageSafe(base64, filename);
+          // Journal: каждый фактически созданный reference image.
+          await journal.addInputFile({ jobId, dispatchId, log }, filePath);
+          log("info", `Multi-image saved: ${filename}`);
+          await waitForFileReady(filePath, expectedSize);
+          log("info", `Multi-image ready: ${filename}`);
+        }
+      } else if (task.assets?.image) {
+        const [baseId] = task.job_id.split(JOB_ID_SPLIT_RE);
+        const filename = `${baseId}.png`;
+        const filePath = path.join(COMFY_INPUT_DIR, filename);
+        createdInputFiles.push(filePath);
+        const { expectedSize } = await saveBase64ImageSafe(task.assets.image, filename);
+        await journal.addInputFile({ jobId, dispatchId, log }, filePath);
+        log("info", `Image saved: ${filename}`);
+        await waitForFileReady(filePath, expectedSize);
+        log("info", `Image ready: ${filename}`);
+      }
+
+      const prompt_id = await runWorkflow(task.params);
+      // timeout_ms приходит с задачей (backend → gpu-hub → worker): per-job
+      // таймаут для данного типа генерации. Если нет — per-type fallback.
+      const result = await waitResult(prompt_id, task.params, task.timeout_ms);
+
+      // Точечный output этой job: COMFY_OUTPUT_DIR + subfolder + filename.
+      // Это именно тот файл, который waitResult выбрал как результат (в т.ч.
+      // для video — реально выбранный mp4 из history/fallback/fs-scan).
+      if (result.meta && result.meta.filename) {
+        outputPath = path.resolve(COMFY_OUTPUT_DIR, result.meta.subfolder || "", result.meta.filename);
+        // Journal: GENERATED — известен конкретный output-файл.
+        await journal.setOutputAndGenerated({ jobId, dispatchId, log }, outputPath);
+      }
+
+      const base64 = await downloadResult(result);
+      log("debug", `result for ${task.job_id}: type=${result.type} size=${Math.round(base64.length / 1024)}KB`);
+      await sendResult(task, base64);
+      // Journal: DELIVERED — HTTP 200 от hub = результат уже durable в hub
+      // Redis (animastor:result:* записан до ответа 200). Output можно удалять.
+      await journal.setDelivered({ jobId, dispatchId, log });
+      outputDelivered = true;
+      log("info", `Done ${task.job_id}`);
+
+    } catch (err) {
+      log("error", `Failed ${task.job_id}`, err.message);
+
+      try {
+        await sendTaskError(task, err && err.message || err || "worker_error");
+      } catch (sendErr) {
+        log("error", "Failed to send error to hub", sendErr.message);
+      }
+    } finally {
+      // Cleanup after job: только собственные временные файлы этой job.
+      // Output — ТОЛЬКО после успешной доставки результата; при ошибке
+      // downloadResult()/sendResult() output сохраняется.
+      try {
+        const toCleanOutput = outputDelivered ? outputPath : null;
+        const cleanupResult = await cleanupJobArtifacts({
+          inputFiles: createdInputFiles,
+          outputFile: toCleanOutput,
+        });
+
+        if (cleanupResult.cleaned > 0 || cleanupResult.failed.length > 0) {
+          log("info",
+            `Cleanup ${task.job_id}: removed ${cleanupResult.cleaned} artifact(s) ` +
+            `(${createdInputFiles.length} input, ${toCleanOutput ? "1 output" : "0 output"})`);
+        }
+        for (const f of cleanupResult.failed) {
+          log("warn", `Cleanup ${task.job_id}: failed to remove ${f.path}: ${f.reason}`);
+        }
+
+        if (cleanupResult.failed.length === 0) {
+          // CLEANED: все файлы job удалены → journal больше не нужен.
+          await journal.removeJob({ jobId, dispatchId, log });
+        } else {
+          // Частичный cleanup: journal остаётся — следующий recovery дочистит
+          // оставшиеся файлы (например, один input из видео-набора).
+          log("warn", `Cleanup ${task.job_id}: partial cleanup (${cleanupResult.failed.length} failed) — journal kept for recovery`);
+        }
+      } catch (cleanupErr) {
+        // Cleanup никогда не должен маскировать исходную ошибку job.
+        log("warn", `Cleanup ${task.job_id}: error: ${cleanupErr.message}`);
+      }
+    }
+  }
+}
+
+// ======================================================
+// MAIN
+// ======================================================
+
+async function main() {
+  // PW-4 FAIL CLOSED startup gate: without a credential the worker refuses
+  // to run. There is no "system pool (no credential)" mode anymore — a
+  // missing token must never silently turn this GPU into shared capacity.
+  if (!ANIMASTOR_WORKER_TOKEN) {
+    log("error", "Worker authentication failed — check ANIMASTOR_WORKER_TOKEN");
+    log("error", "No worker credential configured. This worker cannot start:");
+    log("error", "  1. Open Animastor → Settings → Workers and create a worker");
+    log("error", "     (choose Private for your own workspace, or Share to volunteer it).");
+    log("error", "  2. Copy the one-time credential (wrk.…).");
+    log("error", "  3. Set ANIMASTOR_WORKER_TOKEN=wrk.… in ./.env (or the environment).");
+    process.exit(1);
+  }
+
+  log("info", `Worker ${WORKER_TYPE} started`);
+  log("info", `Worker ID: ${WORKER_ID} (label only — identity comes from the credential)`);
+  log("info", `Worker version: ${WORKER_VERSION || 'unknown'}`);
+  log("info", `Worker image tag: ${WORKER_IMAGE_TAG || 'unknown'}`);
+  log("info", `Hub URL: ${HUB_URL}`);
+  log("info", `Protocol version: ${PROTOCOL_VERSION}`);
+
+  // Confirm identity + mode against the registry before doing any work.
+  await verifyCredential();
+
+  await waitForComfyUI();
+
+  // Crash-safe recovery: завершить cleanup незакрытых job упавшего worker.
+  // delivered → удаляем input+output; created/generated → только input
+  // (output без proof DELIVERED не трогаем — защита единственной копии).
+  await journal.recoverCleanupJournal({ log });
+
+  await workerLoop();
+}
+
+main().catch(err => {
+  log("error", "Worker crashed", err.message);
+  process.exit(1);
+});
