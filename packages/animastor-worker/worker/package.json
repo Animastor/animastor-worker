@@ -22,11 +22,11 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/Animastor/animastor.git",
+    "url": "https://github.com/Animastor/animastor-worker.git",
     "directory": "packages/animastor-worker/worker"
   },
   "bugs": {
-    "url": "https://github.com/Animastor/animastor/issues"
+    "url": "https://github.com/Animastor/animastor-worker/issues"
   },
   "homepage": "https://animastor.in",
   "keywords": [],

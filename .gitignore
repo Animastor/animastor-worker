@@ -1,0 +1,26 @@
+# Dependencies
+node_modules/
+
+# Logs
+*.log
+npm-debug.log*
+
+# Runtime / env
+.env
+.env.local
+*.pid
+
+# Build output
+dist/
+build/
+*.tar.gz
+
+# Test / coverage
+coverage/
+.nyc_output/
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
