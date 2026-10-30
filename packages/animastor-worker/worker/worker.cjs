@@ -1,7 +1,8 @@
 // ======================================================
-// GPU Worker - v2.1.1 (fail-closed authorization, PW-4)
+// GPU Worker - v2.2.0 (fail-closed authorization, PW-4)
 // ======================================================
-// CJS (CommonJS) — Node 18+ with global fetch is assumed.
+// CJS (CommonJS) — Node 20+ (global fetch). Zero runtime dependencies: the
+// bundle runs as-is, there is nothing to npm-install.
 // Job Protocol v2 comes from the GENERATED copy of the canonical
 // @animastor/contracts package (Phase 9D, blocker B2 — option B):
 //   packages/animastor-worker/worker/job-protocol-v2.cjs  (regenerate: node packages/animastor-worker/tools/sync-protocol.cjs)
@@ -43,6 +44,11 @@ const ANIMASTOR_API_URL = process.env.ANIMASTOR_API_URL
   || HUB_URL.replace(/\/gpu\/?$/, "") + "/api/v1";
 
 const NOTEBOOK_PATH = process.env.NOTEBOOK_PATH || "";
+// COMFY_URL — the full ComfyUI API base (scheme://host:port[/prefix]) as
+// probed by the installer / start-worker.sh. When set it wins over
+// COMFY_PORT + NOTEBOOK_PATH, so a reverse-proxy prefix is used only when the
+// probe proved ComfyUI answers there (never guessed).
+const COMFY_URL = (process.env.COMFY_URL || "").replace(/\/+$/, "");
 const WORKER_ID = process.env.WORKER_ID || "gpu-" + os.hostname();
 // Canonical bundle version lives in ./package.json (the hub publishes the
 // same value with the worker-bundle artifact). WORKER_VERSION env overrides.
@@ -92,6 +98,7 @@ async function fetchTimeout(url, options = {}, timeout = 30000) {
 }
 
 function comfyUrl(p) {
+  if (COMFY_URL) return `${COMFY_URL}${p}`;
   return `http://127.0.0.1:${COMFY_PORT}${NOTEBOOK_PATH}${p}`;
 }
 
@@ -195,7 +202,9 @@ function getGPUInfo() {
 // ======================================================
 
 async function waitForComfyUI() {
-  log("info", "Waiting for ComfyUI");
+  // "ComfyUI ready" is a stable marker: the installer and start-worker.sh
+  // report the worker READY only after this exact line appears in the log.
+  log("info", `Waiting for ComfyUI at ${comfyUrl("")}`);
   let attempts = 0;
 
   while (true) {
@@ -206,6 +215,9 @@ async function waitForComfyUI() {
         await sleep(3000);
         return;
       }
+      // A non-2xx answer (e.g. 404 behind a wrong reverse-proxy prefix) used
+      // to be retried silently forever — say what is wrong.
+      log("warn", `ComfyUI not ready (attempt ${attempts + 1}): HTTP ${res.status} from ${comfyUrl("/system_stats")}`);
     } catch (err) {
       log("warn", `ComfyUI not ready (attempt ${attempts + 1}): ${err.message}`);
     }
@@ -220,6 +232,8 @@ async function waitForComfyUI() {
 // ======================================================
 // BEACON
 // ======================================================
+
+let beaconHealthy = false;
 
 async function sendBeacon() {
   try {
@@ -245,7 +259,12 @@ async function sendBeacon() {
     if (!res.ok) {
       throw new Error(`Hub rejected beacon: HTTP ${res.status}`);
     }
+    // Stable marker (logged on the first accepted beacon and after every
+    // recovery): the hub has recorded the heartbeat, Animastor shows ONLINE.
+    if (!beaconHealthy) log("info", "Hub heartbeat accepted — worker is ONLINE");
+    beaconHealthy = true;
   } catch (err) {
+    beaconHealthy = false;
     log("error", "Beacon failed", err.message);
   }
 }
@@ -568,6 +587,9 @@ async function sendTaskError(task, reason) {
 let emptyQueueDelay = TASK_SLEEP_MS;
 
 async function workerLoop() {
+  // First heartbeat right away (not after BEACON_INTERVAL_MS): the worker
+  // shows ONLINE as soon as it is actually serving.
+  sendBeacon();
   setInterval(sendBeacon, BEACON_INTERVAL_MS);
 
   while (true) {

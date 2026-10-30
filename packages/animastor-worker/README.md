@@ -14,7 +14,7 @@ worker/
 │   ├── worker-cleanup.cjs             per-job artifact cleanup
 │   ├── worker-cleanup-journal.cjs     crash-safe cleanup journal
 │   ├── job-protocol-v2.cjs            GENERATED from @animastor/contracts (do not edit)
-│   ├── package.json                   canonical bundle version (2.1.0)
+│   ├── package.json                   canonical bundle version (2.2.0)
 │   └── .env.example                   configuration template
 ├── tests/             package-owned zero-dependency tests (not shipped)
 │   ├── harness.cjs / run-all.cjs

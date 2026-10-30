@@ -15,6 +15,7 @@ const SUITES = [
     './job-protocol.test.cjs',
     './package.test.cjs',
     './standalone.test.cjs',
+    './start-worker.test.cjs',
 ];
 
 (async () => {
