@@ -130,10 +130,13 @@ function authFailed(source, status) {
 async function verifyCredential() {
   let res;
   try {
+    // worker_version is diagnostics only: the backend persists it on the
+    // worker row (workers.version) so Settings can show which bundle a node
+    // actually runs. It never participates in authorization.
     res = await fetchTimeout(`${ANIMASTOR_API_URL}/worker/verify`, {
       method: "POST",
       headers: hubHeaders(),
-      body: JSON.stringify({})
+      body: JSON.stringify({ worker_version: WORKER_VERSION })
     });
   } catch (err) {
     // Network failure — the backend may be temporarily down. The hub still
