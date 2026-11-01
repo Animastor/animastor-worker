@@ -64,6 +64,15 @@ describe('worker package — manifest (standalone package)', () => {
         expect.notOk(fs.existsSync(path.join(BUNDLE_DIR, 'node_modules')), 'node_modules must not be committed into the bundle');
     });
 
+    it('credential verification reports the bundle version (workers.version)', () => {
+        // The backend stores this value on the worker row; without it
+        // Settings shows version=NULL for otherwise healthy workers.
+        const src = fs.readFileSync(path.join(BUNDLE_DIR, 'worker.cjs'), 'utf8');
+        const block = src.match(/async function verifyCredential\(\)[\s\S]*?\n\}/);
+        expect.ok(block, 'verifyCredential() must exist');
+        expect.include(block[0], 'worker_version: WORKER_VERSION');
+    });
+
     it('.env.example documents the full env contract (no secrets)', () => {
         const envExample = fs.readFileSync(path.join(BUNDLE_DIR, '.env.example'), 'utf8');
         for (const key of ['HUB_URL', 'ANIMASTOR_WORKER_TOKEN', 'WORKER_TYPE', 'WORKER_ID']) {
