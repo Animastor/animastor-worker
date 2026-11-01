@@ -1,5 +1,5 @@
 // ======================================================
-// GPU Worker - v2.2.0 (fail-closed authorization, PW-4)
+// GPU Worker - v2.2.1 (fail-closed authorization, PW-4)
 // ======================================================
 // CJS (CommonJS) — Node 20+ (global fetch). Zero runtime dependencies: the
 // bundle runs as-is, there is nothing to npm-install.
