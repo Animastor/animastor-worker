@@ -16,6 +16,7 @@ const SUITES = [
     './package.test.cjs',
     './standalone.test.cjs',
     './start-worker.test.cjs',
+    './node-readiness.test.cjs',
 ];
 
 (async () => {
