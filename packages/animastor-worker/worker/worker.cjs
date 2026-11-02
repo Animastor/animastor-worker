@@ -1,5 +1,5 @@
 // ======================================================
-// GPU Worker - v2.2.1 (fail-closed authorization, PW-4)
+// GPU Worker - v2.2.2 (fail-closed authorization, PW-4; node-class readiness)
 // ======================================================
 // CJS (CommonJS) — Node 20+ (global fetch). Zero runtime dependencies: the
 // bundle runs as-is, there is nothing to npm-install.
@@ -233,6 +233,105 @@ async function waitForComfyUI() {
 }
 
 // ======================================================
+// NODE-CLASS READINESS (GPU E2E 2026-11-02)
+// ======================================================
+// "ComfyUI answered" is not "this worker can run its profile": on 02.11 a
+// worker 2.2.0 took 6 audio dispatches in 90 s from a ComfyUI without the
+// qwen-tts nodes; ComfyUI rejected every prompt ("No prompt_id") and each
+// rejection became a retry on the backend. Readiness is now: ComfyUI API
+// answers AND /object_info lists every node class of the worker's profile.
+// Until then the worker does not ask for tasks; one log line per distinct
+// reason; the check is repeated with backoff.
+//
+// The class list (no list → readiness = ComfyUI API only, as before):
+//   1. REQUIRED_NODE_CLASSES=ClassA,ClassB   (environment / .env)
+//   2. node-classes.json next to worker.cjs (NODE_CLASSES_FILE overrides):
+//        { "profiles": { "audio/qwen-tts": ["ClassA", "ClassB"] } }
+//      — only profiles of this WORKER_TYPE ("<type>/…") are used.
+const NODE_CLASSES_FILE = process.env.NODE_CLASSES_FILE || path.join(__dirname, "node-classes.json");
+const NODE_CLASS_RECHECK_MIN_MS = Number(process.env.NODE_CLASS_RECHECK_MIN_MS || 5000);
+const NODE_CLASS_RECHECK_MAX_MS = Number(process.env.NODE_CLASS_RECHECK_MAX_MS || 300000);
+
+function loadRequiredNodeClasses() {
+  const fromEnv = String(process.env.REQUIRED_NODE_CLASSES || "")
+    .split(",").map((c) => c.trim()).filter(Boolean);
+  if (fromEnv.length > 0) {
+    return { classes: [...new Set(fromEnv)], source: "REQUIRED_NODE_CLASSES", profiles: [] };
+  }
+  let doc = null;
+  try {
+    doc = JSON.parse(fs.readFileSync(NODE_CLASSES_FILE, "utf8"));
+  } catch (err) {
+    if (err && err.code !== "ENOENT") {
+      log("warn", `Node classes: cannot read ${NODE_CLASSES_FILE} (${err.message}) — readiness = ComfyUI API only`);
+    }
+    return { classes: [], source: null, profiles: [] };
+  }
+  const classes = new Set();
+  const profiles = [];
+  const byProfile = (doc && typeof doc.profiles === "object" && doc.profiles) || {};
+  for (const [profile, list] of Object.entries(byProfile)) {
+    if (!String(profile).startsWith(`${WORKER_TYPE}/`) || !Array.isArray(list)) continue;
+    profiles.push(profile);
+    for (const c of list) if (typeof c === "string" && c.trim()) classes.add(c.trim());
+  }
+  return { classes: [...classes], source: path.basename(NODE_CLASSES_FILE), profiles };
+}
+
+async function fetchObjectInfoClasses() {
+  const res = await fetchTimeout(comfyUrl("/object_info"), {}, 60000);
+  if (!res.ok) throw new Error(`HTTP ${res.status} from ${comfyUrl("/object_info")}`);
+  const data = await res.json();
+  if (!data || typeof data !== "object") throw new Error("/object_info is not a JSON object");
+  return new Set(Object.keys(data));
+}
+
+/**
+ * Block until ComfyUI's /object_info lists every required class. Returns
+ * immediately when no class list is configured. One log line per distinct
+ * reason (not per attempt); backoff NODE_CLASS_RECHECK_MIN_MS → MAX_MS.
+ */
+async function waitForNodeClasses() {
+  const required = loadRequiredNodeClasses();
+  if (required.classes.length === 0) {
+    if (noListWarned) return required;
+    noListWarned = true;
+    log("warn", `Node classes: no profile list (REQUIRED_NODE_CLASSES / ${path.basename(NODE_CLASSES_FILE)}) — readiness = ComfyUI API only; run \`animastor doctor\` to write the list`);
+    return required;
+  }
+  const what = required.profiles.length ? required.profiles.join(", ") : required.source;
+  let delay = NODE_CLASS_RECHECK_MIN_MS;
+  let lastReason = null;
+  while (true) {
+    let reason;
+    try {
+      const have = await fetchObjectInfoClasses();
+      const missing = required.classes.filter((c) => !have.has(c));
+      if (missing.length === 0) {
+        log("info", `Node classes ready: ${required.classes.length}/${required.classes.length} (${what})`);
+        return required;
+      }
+      reason = `ComfyUI lacks node classes ${missing.join(", ")} required by ${what}`;
+    } catch (err) {
+      reason = `ComfyUI /object_info unavailable (${err.message})`;
+    }
+    if (reason !== lastReason) {
+      log("warn", `Not taking tasks: ${reason} — re-checking with backoff (up to ${Math.round(NODE_CLASS_RECHECK_MAX_MS / 1000)} s)`);
+      lastReason = reason;
+    }
+    await sleep(delay);
+    delay = Math.min(delay * 2, NODE_CLASS_RECHECK_MAX_MS);
+  }
+}
+
+// Set when ComfyUI rejected a prompt (e.g. a node vanished after a ComfyUI
+// restart): the next loop iteration re-runs the readiness gate before it
+// asks the hub for another task.
+let nodeReadinessStale = false;
+// The "no class list" warning is printed once per process.
+let noListWarned = false;
+
+// ======================================================
 // BEACON
 // ======================================================
 
@@ -370,7 +469,14 @@ async function runWorkflow(workflow) {
 
   if (!data.prompt_id) {
     log("error", "ComfyUI error", data);
-    throw new Error("No prompt_id");
+    nodeReadinessStale = true;
+    // Keep the "No prompt_id" prefix (backend/log compatibility) and carry
+    // ComfyUI's own reason (e.g. invalid_prompt: node X does not exist).
+    const e = data && data.error;
+    const detail = e && typeof e === "object"
+      ? [e.type, e.message].filter(Boolean).join(": ")
+      : (typeof e === "string" ? e : "");
+    throw new Error(detail ? `No prompt_id: ${String(detail).slice(0, 300)}` : "No prompt_id");
   }
 
   return data.prompt_id;
@@ -596,6 +702,10 @@ async function workerLoop() {
   setInterval(sendBeacon, BEACON_INTERVAL_MS);
 
   while (true) {
+    if (nodeReadinessStale) {
+      nodeReadinessStale = false;
+      await waitForNodeClasses();
+    }
     const task = await getTask();
 
     if (!task) {
@@ -760,6 +870,10 @@ async function main() {
   await verifyCredential();
 
   await waitForComfyUI();
+
+  // Readiness = ComfyUI API answered AND /object_info has the profile's node
+  // classes. No task is requested (and no heartbeat sent) before that.
+  await waitForNodeClasses();
 
   // Crash-safe recovery: завершить cleanup незакрытых job упавшего worker.
   // delivered → удаляем input+output; created/generated → только input
