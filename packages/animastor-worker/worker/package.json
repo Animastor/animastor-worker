@@ -1,6 +1,6 @@
 {
   "name": "animastor-worker",
-  "version": "2.2.2",
+  "version": "2.2.3",
   "description": "Animastor GPU Worker runtime bundle. The version field is the canonical worker bundle version: the hub publishes it with the bundle artifact (GET /worker-bundle) and worker.cjs reports it in beacons when WORKER_VERSION is not set.",
   "main": "worker.cjs",
   "files": [
