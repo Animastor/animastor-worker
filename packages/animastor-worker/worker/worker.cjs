@@ -1,5 +1,5 @@
 // ======================================================
-// GPU Worker - v2.2.2 (fail-closed authorization, PW-4; node-class readiness)
+// GPU Worker - v2.2.3 (fail-closed authorization, PW-4; node-class readiness; task/error error_class)
 // ======================================================
 // CJS (CommonJS) — Node 20+ (global fetch). Zero runtime dependencies: the
 // bundle runs as-is, there is nothing to npm-install.
@@ -444,19 +444,39 @@ async function waitForFileReady(filePath, expectedSize, timeout = 5000) {
 // RUN WORKFLOW
 // ======================================================
 
+// 2.2.3 (GPU retry policy, 2026-11-02): an Error may carry the optional
+// structured fields sent with POST /task/error — `errorClass`
+// (deterministic | transient | oom) and `comfyStatus` (HTTP status of
+// ComfyUI POST /prompt). The backend classifies by them first and falls back
+// to the reason text for older workers; the text stays as before.
+function classifiedError(message, errorClass, comfyStatus) {
+  const err = new Error(message);
+  if (errorClass) err.errorClass = errorClass;
+  if (Number.isInteger(comfyStatus)) err.comfyStatus = comfyStatus;
+  return err;
+}
+
+const OOM_RE = /cuda out of memory|outofmemoryerror|cuda error: out of memory|allocation on device/i;
+
 async function runWorkflow(workflow) {
   const body = workflow?.prompt
     ? { ...workflow, client_id: WORKER_ID }
     : { prompt: workflow, client_id: WORKER_ID };
 
-  const res = await fetchTimeout(
-    comfyUrl("/prompt"),
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body)
-    }
-  );
+  let res;
+  try {
+    res = await fetchTimeout(
+      comfyUrl("/prompt"),
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body)
+      }
+    );
+  } catch (err) {
+    // ComfyUI unreachable / request aborted — the attempt may succeed later.
+    throw classifiedError(`ComfyUI /prompt request failed: ${err && err.message || err}`, "transient");
+  }
 
   const text = await res.text();
 
@@ -464,7 +484,11 @@ async function runWorkflow(workflow) {
   try {
     data = JSON.parse(text);
   } catch {
-    throw new Error("Invalid JSON from ComfyUI: " + text.slice(0, 500));
+    throw classifiedError(
+      "Invalid JSON from ComfyUI: " + text.slice(0, 500),
+      res.status >= 500 ? "transient" : null,
+      res.status
+    );
   }
 
   if (!data.prompt_id) {
@@ -476,10 +500,40 @@ async function runWorkflow(workflow) {
     const detail = e && typeof e === "object"
       ? [e.type, e.message].filter(Boolean).join(": ")
       : (typeof e === "string" ? e : "");
-    throw new Error(detail ? `No prompt_id: ${String(detail).slice(0, 300)}` : "No prompt_id");
+    // ComfyUI answered and rejected the prompt (validation / node_errors):
+    // deterministic. A 5xx without prompt_id is ComfyUI itself failing.
+    const cls = res.status >= 500 ? "transient" : "deterministic";
+    throw classifiedError(
+      detail ? `No prompt_id: ${String(detail).slice(0, 300)}` : "No prompt_id",
+      cls,
+      res.status
+    );
   }
 
   return data.prompt_id;
+}
+
+// 2.2.3: ComfyUI finished the prompt with an execution error (history
+// status_str "error", message "execution_error"). Before 2.2.3 the worker kept
+// polling until the result timeout; now it fails right away with ComfyUI's
+// exception. CUDA OOM → errorClass "oom"; other execution errors carry no
+// class (the backend treats them as unknown → no retry).
+function executionErrorOf(entry) {
+  const st = entry && entry.status;
+  if (!st || st.status_str !== "error") return null;
+  let exType = "";
+  let exMsg = "";
+  for (const m of Array.isArray(st.messages) ? st.messages : []) {
+    if (Array.isArray(m) && m[0] === "execution_error" && m[1]) {
+      exType = m[1].exception_type || "";
+      exMsg = m[1].exception_message || "";
+      if (m[1].node_type) exMsg = `${m[1].node_type}: ${exMsg}`;
+      break;
+    }
+  }
+  const detail = [exType, exMsg].filter(Boolean).join(": ").replace(/\s+/g, " ").trim();
+  const message = `ComfyUI execution error${detail ? `: ${detail.slice(0, 300)}` : ""}`;
+  return classifiedError(message, OOM_RE.test(detail) ? "oom" : null);
 }
 
 // ======================================================
@@ -521,12 +575,17 @@ async function waitResult(prompt_id, workflow, timeoutMs) {
       } catch (err) {
         log("error", "Timeout: failed to fetch history", err.message);
       }
-      throw new Error(`Timeout waiting result (${Math.round(effectiveTimeoutMs / 60000)}min)`);
+      throw classifiedError(`Timeout waiting result (${Math.round(effectiveTimeoutMs / 60000)}min)`, "transient");
     }
 
     try {
       const res = await fetchTimeout(comfyUrl(`/history/${prompt_id}`));
       const data = await res.json();
+      const execErr = executionErrorOf(data?.[prompt_id]);
+      if (execErr) {
+        log("error", `ComfyUI execution error for prompt ${prompt_id}`, execErr.message);
+        throw execErr;
+      }
       const outputs = data?.[prompt_id]?.outputs || {};
 
       for (const id of outputsMap.image) {
@@ -580,6 +639,7 @@ async function waitResult(prompt_id, workflow, timeoutMs) {
       // Reset poll delay on successful response
       pollDelay = 500;
     } catch (err) {
+      if (err && err.message && err.message.startsWith("ComfyUI execution error")) throw err;
       log("warn", "waitResult poll failed", err.message);
       // Exponential backoff on error: 1s → 2s → 4s → 8s cap
       pollDelay = Math.min(pollDelay * 2, 8000);
@@ -670,19 +730,23 @@ async function sendResult(task, data) {
   }
 }
 
-async function sendTaskError(task, reason) {
+async function sendTaskError(task, reason, meta = {}) {
+  const payload = {
+    job_id: task.job_id,
+    build_id: task.build_id || null,
+    dispatch_id: task.dispatch_id,
+    protocol_version: PROTOCOL_VERSION,
+    reason: String(reason || "worker_error").slice(0, 500),
+    worker_version: WORKER_VERSION,
+    worker_image_tag: WORKER_IMAGE_TAG
+  };
+  // 2.2.3: optional, additive (older hubs/backends ignore unknown fields).
+  if (meta.errorClass) payload.error_class = meta.errorClass;
+  if (Number.isInteger(meta.comfyStatus)) payload.comfy_status = meta.comfyStatus;
   const res = await fetchTimeout(`${HUB_URL}/task/error`, {
     method: "POST",
     headers: hubHeaders(),
-    body: JSON.stringify({
-      job_id: task.job_id,
-      build_id: task.build_id || null,
-      dispatch_id: task.dispatch_id,
-      protocol_version: PROTOCOL_VERSION,
-      reason: String(reason || "worker_error").slice(0, 500),
-      worker_version: WORKER_VERSION,
-      worker_image_tag: WORKER_IMAGE_TAG
-    })
+    body: JSON.stringify(payload)
   });
   if (!res.ok) {
     throw new Error(`Hub rejected task error: HTTP ${res.status}`);
@@ -722,7 +786,7 @@ async function workerLoop() {
       log("error", `Rejecting incompatible task: protocol=${task.protocol_version}, dispatch=${task.dispatch_id || 'missing'}`);
       if (task.job_id && task.build_id && task.dispatch_id) {
         try {
-          await sendTaskError(task, reason);
+          await sendTaskError(task, reason, { errorClass: "deterministic" });
         } catch (sendErr) {
           log("error", "Failed to report incompatible task", sendErr.message);
         }
@@ -801,7 +865,10 @@ async function workerLoop() {
       log("error", `Failed ${task.job_id}`, err.message);
 
       try {
-        await sendTaskError(task, err && err.message || err || "worker_error");
+        await sendTaskError(task, err && err.message || err || "worker_error", {
+          errorClass: err && err.errorClass,
+          comfyStatus: err && err.comfyStatus
+        });
       } catch (sendErr) {
         log("error", "Failed to send error to hub", sendErr.message);
       }

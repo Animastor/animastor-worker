@@ -283,9 +283,14 @@ worker → `POST /task/error`:
 | `protocol_version` | `!== 2` → 400 `invalid` |
 | `reason` | строка; worker truncate до 500 символов, default `"worker_error"` (`worker.cjs:549`) |
 | `worker_version`, `worker_image_tag` | extra-поля; hub игнорирует **[CURRENT BEHAVIOR]** |
+| `error_class` | необязательное (воркер 2.2.3+, 2026-11-02): `deterministic` \| `transient` \| `oom`; hub v0.2.8+ пересылает в backend после проверки формы, иначе отбрасывает |
+| `comfy_status` | необязательное (2.2.3+): HTTP-статус ComfyUI `POST /prompt`, целое 100..599; пересылается так же |
 
 Hub: те же claim/staleness проверки (409/403); освобождает queue-dedup;
-форвардит в backend `POST /gpu/task/error` → `orchestrator.failStage`.
+форвардит в backend `POST /gpu/task/error` → политика повторов backend
+(классификация по `error_class` / `comfy_status` / тексту `reason`, затем
+`orchestrator.failStage` без немедленного re-dispatch; animastor-docs
+`architecture/COMMAND_ONLY_GENERATION.md` §«Повтор после ошибки воркера»).
 Backend dedup `animastor:error-processed:...` EX 60 (короткий).
 
 ### 3.12 Beacon envelope (worker → hub)

@@ -212,6 +212,9 @@ describe('worker — node-class readiness (2.2.2)', () => {
         try {
             expect.ok(await until(() => hubState.errors.length === 1, 12000), `task error not sent: ${out.text.slice(-800)}`);
             expect.include(hubState.errors[0].reason || hubState.errors[0].error || JSON.stringify(hubState.errors[0]), 'No prompt_id: invalid_prompt');
+            // 2.2.3: structured fields for the backend retry policy.
+            expect.equal(hubState.errors[0].error_class, 'deterministic');
+            expect.equal(hubState.errors[0].comfy_status, 400);
             expect.equal(comfyState.promptCalls, 1);
             expect.ok(await until(() => comfyState.objectInfoCalls > callsAtError, 6000), 'gate re-run after the rejected prompt');
         } finally {
