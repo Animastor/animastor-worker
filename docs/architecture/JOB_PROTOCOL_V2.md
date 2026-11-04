@@ -339,7 +339,14 @@ Backend dedup `animastor:error-processed:...` EX 60 (короткий).
   404 `not registered`; 409 `worker_type_mismatch` /
   `worker_protocol_mismatch`.
 - `/task/result`, `/task/error`: 200 `{ok:true}`; 400 `invalid`; 403
-  `not_task_claimer`; 409 `stale_or_unknown_dispatch`.
+  `not_task_claimer`; 409 `stale_or_unknown_dispatch`. Hub v0.2.9+: тело 409 —
+  `{error:"stale_or_unknown_dispatch", detail, job_id, dispatch_id}`, `detail` =
+  `no_running_record` (claim этой job снят из `animastor:running`; hub один раз
+  сообщает backend'у `reason=stale_dispatch_result`, результат не принимается)
+  | `dispatch_mismatch` (job перевыдана другим dispatch). Воркер 2.3.0+ пишет
+  тело ответа (≤ 300 символов) в лог и в `reason` последующего `task/error`;
+  поле `error` прежнее — старые воркеры не затронуты. Канон — animastor-docs
+  `architecture/GPU_HUB_CONTRACT.md`.
 - `/beacon`: 200 `{ok:true}`; 400 `worker_identity_required`; 401; 409
   `protocol_version_mismatch`.
 - backend `/gpu/task/result`: 200 `{ok:true}` | `{ok:true,rejected:true,reason}`

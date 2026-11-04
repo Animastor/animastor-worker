@@ -18,6 +18,7 @@ const SUITES = [
     './start-worker.test.cjs',
     './node-readiness.test.cjs',
     './task-error-class.test.cjs',
+    './hub-409-body.test.cjs',
 ];
 
 (async () => {

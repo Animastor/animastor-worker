@@ -1,5 +1,5 @@
 // ======================================================
-// GPU Worker - v2.2.3 (fail-closed authorization, PW-4; node-class readiness; task/error error_class)
+// GPU Worker - v2.3.0 (fail-closed authorization, PW-4; node-class readiness; task/error error_class; hub 409 body logged)
 // ======================================================
 // CJS (CommonJS) — Node 20+ (global fetch). Zero runtime dependencies: the
 // bundle runs as-is, there is nothing to npm-install.
@@ -726,8 +726,27 @@ async function sendResult(task, data) {
     })
   });
   if (!res.ok) {
-    throw new Error(`Hub rejected result: HTTP ${res.status}`);
+    throw await hubRejection(res, "result");
   }
+}
+
+// 2.3.0 (2026-11-04): a rejected result / task error is logged WITH the hub's
+// answer body, not only the status — hub v0.2.9 answers 409
+// stale_or_unknown_dispatch with `detail` (no_running_record |
+// dispatch_mismatch) + job_id / dispatch_id. The body is capped (300 chars)
+// and never carries secrets (the hub echoes only ids and error codes).
+const HUB_BODY_LOG_MAX = 300;
+
+async function hubRejection(res, what) {
+  let text = "";
+  try { text = typeof res.text === "function" ? await res.text() : ""; } catch (_) { text = ""; }
+  text = String(text || "").replace(/\s+/g, " ").trim().slice(0, HUB_BODY_LOG_MAX);
+  let detail = null;
+  try { const j = JSON.parse(text); detail = j && typeof j.detail === "string" ? j.detail : null; } catch (_) {}
+  const err = new Error(`Hub rejected ${what}: HTTP ${res.status}${text ? ` ${text}` : ""}`);
+  err.hubStatus = res.status;
+  err.hubDetail = detail;
+  return err;
 }
 
 async function sendTaskError(task, reason, meta = {}) {
@@ -749,7 +768,7 @@ async function sendTaskError(task, reason, meta = {}) {
     body: JSON.stringify(payload)
   });
   if (!res.ok) {
-    throw new Error(`Hub rejected task error: HTTP ${res.status}`);
+    throw await hubRejection(res, "task error");
   }
 }
 
