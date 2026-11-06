@@ -76,6 +76,20 @@ Guards: `worker/tests/job-protocol.test.cjs` (package level) and
 `backend/tests/architecture/phase9d-worker-package.test.js` (repo level,
 includes a negative control).
 
+## Protocol 3 (bundle 2.4.0, ORCHESTRATION_V2 §8)
+
+Each loop iteration: `GET {HUB_URL}/v3/task/next` (hub relay to the backend
+gen core) → if a task: run the workflow, stream the output file with
+`PUT upload_url` (`Authorization: Bearer upload_token`, raw bytes, no base64;
+retried on network error / 5xx up to 5 attempts; 409 / 401 → the job is
+dropped); an execution error → `POST error_url {error_class, reason,
+comfy_status}` with the same token. `{task:null}` / 404 / 503 → one classic
+v2 `/task/next` pop (as 2.3.0); the empty-queue backoff (2 → 15 s) applies
+only when both are empty. `POST /v3/beacon` every 10 s next to the v2 beacon
+reports `current_job_id`; a cancelled current job → ComfyUI `/interrupt`, no
+upload. `task.timeout_ms` only interrupts ComfyUI (`error_class=timeout`) —
+the job status belongs to the backend. `WORKER_PROTOCOL=v2only` disables /v3.
+
 ## Tests (zero dependencies)
 
 ```sh
