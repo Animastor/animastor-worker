@@ -1,6 +1,15 @@
 // ======================================================
-// GPU Worker - v2.3.0 (fail-closed authorization, PW-4; node-class readiness; task/error error_class; hub 409 body logged)
+// GPU Worker - v2.4.0 (protocol 3: pull via hub /v3, PUT result stream, cancel from beacon; v2 compat)
 // ======================================================
+// 2.4.0 (ORCHESTRATION_V2 §8, stage 1c): every loop iteration asks the hub
+// relay GET /v3/task/next first; on {task:null} / 404 / 503 (old hub, backend
+// off) it makes ONE v2 /task/next pop exactly as 2.3.0. A protocol-3 task's
+// result is streamed with PUT upload_url (Bearer upload_token, no base64), an
+// execution error goes to error_url with the same token — both straight to the
+// backend. POST /v3/beacon every 10 s next to the v2 beacon; a cancelled
+// current job → ComfyUI /interrupt, nothing is uploaded. The worker owns no
+// status-changing timeout (I3): task.timeout_ms only interrupts ComfyUI and is
+// reported as error_class=timeout. WORKER_PROTOCOL=v2only|both (default both).
 // CJS (CommonJS) — Node 20+ (global fetch). Zero runtime dependencies: the
 // bundle runs as-is, there is nothing to npm-install.
 // Job Protocol v2 comes from the GENERATED copy of the canonical
@@ -13,6 +22,8 @@ const os = require("os");
 const fs = require("fs");
 const fsp = require("fs").promises;
 const path = require("path");
+const http = require("http");
+const https = require("https");
 const { cleanupJobArtifacts } = require("./worker-cleanup.cjs");
 const journal = require("./worker-cleanup-journal.cjs");
 const { loadDotEnv } = require("./worker-env.cjs");
@@ -69,6 +80,19 @@ const RESULT_TIMEOUT_MS = Number(process.env.RESULT_TIMEOUT_MS || 600000);
 const VIDEO_RESULT_TIMEOUT_MS = Number(process.env.VIDEO_RESULT_TIMEOUT_MS || 7200000);
 const TASK_SLEEP_MS = Number(process.env.TASK_SLEEP_MS || 2000);
 const BEACON_INTERVAL_MS = Number(process.env.BEACON_INTERVAL_MS || 10000);
+
+// 2.4.0: protocol selection. both (default) = v3 relay first, then one v2
+// pop per iteration; v2only = exactly the 2.3.0 loop (no /v3 calls at all).
+const WORKER_PROTOCOL = (() => {
+  const v = String(process.env.WORKER_PROTOCOL || "both").trim().toLowerCase();
+  return v === "v2only" ? "v2only" : "both";
+})();
+const V3_PROTOCOL_VERSION = 3;
+// PUT result / POST error to the backend: attempts on network error / 5xx.
+const V3_DELIVERY_ATTEMPTS = Number(process.env.V3_DELIVERY_ATTEMPTS || 5);
+const V3_DELIVERY_BACKOFF_MS = Number(process.env.V3_DELIVERY_BACKOFF_MS || 1000);
+// Socket idle timeout of one upload attempt (not a job timeout).
+const V3_UPLOAD_IDLE_MS = Number(process.env.V3_UPLOAD_IDLE_MS || 120000);
 
 const COMFY_INPUT_DIR = process.env.COMFY_INPUT_DIR || "/home/jovyan/ComfyUI/input";
 const COMFY_OUTPUT_DIR = path.resolve(COMFY_INPUT_DIR, "../output");
@@ -337,9 +361,9 @@ let noListWarned = false;
 
 let beaconHealthy = false;
 
-async function sendBeacon() {
+async function sendBeacon(gpuSnapshot) {
   try {
-    const gpu = getGPUInfo();
+    const gpu = gpuSnapshot || getGPUInfo();
 
     const res = await fetchTimeout(`${HUB_URL}/beacon`, {
       method: "POST",
@@ -540,7 +564,7 @@ function executionErrorOf(entry) {
 // WAIT RESULT (with backoff)
 // ======================================================
 
-async function waitResult(prompt_id, workflow, timeoutMs) {
+async function waitResult(prompt_id, workflow, timeoutMs, opts = {}) {
   const start = Date.now();
   const outputsMap = findOutputNodes(workflow);
   const isVideoJob = outputsMap.video.length > 0;
@@ -567,6 +591,8 @@ async function waitResult(prompt_id, workflow, timeoutMs) {
 
   let pollDelay = 500;
   while (true) {
+    // 2.4.0: a protocol-3 job cancelled via the beacon stops waiting at once.
+    if (opts.shouldAbort && opts.shouldAbort()) throw cancelledError();
     if (Date.now() - start > effectiveTimeoutMs) {
       try {
         const res = await fetchTimeout(comfyUrl(`/history/${prompt_id}`));
@@ -575,7 +601,7 @@ async function waitResult(prompt_id, workflow, timeoutMs) {
       } catch (err) {
         log("error", "Timeout: failed to fetch history", err.message);
       }
-      throw classifiedError(`Timeout waiting result (${Math.round(effectiveTimeoutMs / 60000)}min)`, "transient");
+      throw classifiedError(`Timeout waiting result (${Math.round(effectiveTimeoutMs / 60000)}min)`, opts.timeoutErrorClass || "transient");
     }
 
     try {
@@ -773,21 +799,342 @@ async function sendTaskError(task, reason, meta = {}) {
 }
 
 // ======================================================
+// PROTOCOL 3 (2.4.0) — hub relay /v3, result PUT, cancel via beacon
+// ======================================================
+
+// The protocol-3 job being executed right now (null between jobs). The v3
+// beacon reports its id; a cancel for it flips `cancelled` and interrupts
+// ComfyUI. Nothing else is shared between the beacon and the loop.
+let currentV3 = null;
+let v3HubState = null;          // last /v3/task/next outcome class (log on change only)
+
+function cancelledError() {
+  const err = new Error("cancelled by the backend (beacon)");
+  err.cancelled = true;
+  return err;
+}
+
+async function interruptComfy(promptId, why) {
+  try {
+    await fetchTimeout(comfyUrl("/interrupt"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(promptId ? { prompt_id: promptId } : {}),
+    }, 10000);
+    log("info", `ComfyUI /interrupt sent (${why}${promptId ? `, prompt ${promptId}` : ""})`);
+  } catch (err) {
+    log("warn", `ComfyUI /interrupt failed (${why})`, err && err.message || err);
+  }
+}
+
+function noteV3State(state, detail) {
+  if (state === v3HubState) return;
+  v3HubState = state;
+  if (state === "ok") log("info", "Hub protocol 3 (/v3) available");
+  else log("info", `Hub protocol 3 unavailable (${detail}) — serving v2 /task/next`);
+}
+
+async function sendBeaconV3(gpuSnapshot) {
+  const job = currentV3;
+  try {
+    const gpu = gpuSnapshot || getGPUInfo();
+    const res = await fetchTimeout(`${HUB_URL}/v3/beacon`, {
+      method: "POST",
+      headers: hubHeaders(),
+      body: JSON.stringify({
+        gpu: gpu.name,
+        vram: gpu.vram,
+        version: WORKER_VERSION,
+        image_tag: WORKER_IMAGE_TAG,
+        current_job_id: job ? job.jobId : null,
+      }),
+    }, 15000);
+    if (res.status === 401) {
+      authFailed("GPU hub /v3/beacon", res.status);
+      return;
+    }
+    if (!res.ok) return;          // old hub (404) / backend off (503): the v2 beacon still runs
+    const data = await res.json().catch(() => ({}));
+    const cancel = Array.isArray(data && data.cancel) ? data.cancel : [];
+    if (job && !job.cancelled && cancel.includes(job.jobId) && currentV3 === job) {
+      job.cancelled = true;
+      log("info", `Job ${job.jobId} cancelled by the backend — interrupting ComfyUI, no upload`);
+      // no prompt yet: runV3Task interrupts right after /prompt answers (never a blind interrupt)
+      if (job.promptId) await interruptComfy(job.promptId, "cancel");
+    }
+  } catch (err) {
+    log("warn", "v3 beacon failed", err && err.message || err);
+  }
+}
+
+/** One relay call. → task | null; never throws. 401 = the hub rejected OUR credential → terminal. */
+async function getTaskV3() {
+  try {
+    const res = await fetchTimeout(`${HUB_URL}/v3/task/next?type=${encodeURIComponent(WORKER_TYPE)}`, { headers: hubHeaders() }, 20000);
+    if (res.status === 401) {
+      authFailed("GPU hub /v3/task/next", res.status);
+      return null;
+    }
+    if (!res.ok) {
+      noteV3State(`http_${res.status}`, `HTTP ${res.status}`);
+      return null;
+    }
+    const data = await res.json();
+    noteV3State("ok");
+    return data && data.task ? data.task : null;
+  } catch (err) {
+    noteV3State("error", err && err.message || String(err));
+    return null;
+  }
+}
+
+const MIME_BY_TYPE = { audio: "audio/mpeg", image: "image/png", video: "video/mp4" };
+
+/**
+ * Where the result bytes come from — never base64 on the wire:
+ *   ComfyUI output file on disk (COMFY_OUTPUT_DIR) → stream;
+ *   not on disk → stream ComfyUI /view;
+ *   inline audio data from history (rare) → one buffer.
+ */
+async function resultSource(result) {
+  if (result.type === "audio_base64") {
+    const raw = String(result.data || "");
+    const buf = Buffer.from(raw.includes(",") ? raw.split(",")[1] : raw, "base64");
+    return { kind: "buffer", buffer: buf, size: buf.length, contentType: "audio/mpeg", label: "inline audio" };
+  }
+  const f = result.meta || {};
+  const ext = path.extname(f.filename || "").toLowerCase();
+  const contentType = MIME_MAP[ext] || MIME_BY_TYPE[result.type] || "application/octet-stream";
+  const localPath = path.resolve(COMFY_OUTPUT_DIR, f.subfolder || "", f.filename || "");
+  const st = await fsp.stat(localPath).catch(() => null);
+  if (st && st.isFile() && st.size > 0) {
+    return { kind: "file", path: localPath, size: st.size, contentType, label: f.filename };
+  }
+  let sf = f.subfolder || "";
+  if (sf.includes("/")) sf = sf.split("/")[0];
+  const url = comfyUrl(`/view?filename=${encodeURIComponent(f.filename || "")}&subfolder=${encodeURIComponent(sf)}&type=output`);
+  return { kind: "url", url, size: null, contentType, label: `${f.filename} (ComfyUI /view)` };
+}
+
+function openHttpGetStream(urlStr) {
+  return new Promise((resolve, reject) => {
+    const u = new URL(urlStr);
+    const mod = u.protocol === "https:" ? https : http;
+    const req = mod.get(u, (res) => {
+      if (res.statusCode !== 200) { res.resume(); return reject(new Error(`ComfyUI /view HTTP ${res.statusCode}`)); }
+      const len = Number(res.headers["content-length"]);
+      resolve({ stream: res, size: Number.isFinite(len) && len > 0 ? len : null });
+    });
+    req.setTimeout(60000, () => req.destroy(new Error("ComfyUI /view timeout")));
+    req.on("error", reject);
+  });
+}
+
+/** One HTTP request with a streamed / buffered body. → {status, text}; rejects on network error. */
+function httpSend(urlStr, method, headers, body) {
+  return new Promise((resolve, reject) => {
+    const u = new URL(urlStr);
+    const mod = u.protocol === "https:" ? https : http;
+    const req = mod.request(u, { method, headers }, (res) => {
+      let text = "";
+      res.setEncoding("utf8");
+      res.on("data", (c) => { if (text.length < 2000) text += c; });
+      res.on("end", () => resolve({ status: res.statusCode, text }));
+      res.on("error", reject);
+    });
+    req.setTimeout(V3_UPLOAD_IDLE_MS, () => req.destroy(new Error(`no progress for ${V3_UPLOAD_IDLE_MS}ms`)));
+    req.on("error", reject);
+    if (body == null) return req.end();
+    if (Buffer.isBuffer(body) || typeof body === "string") return req.end(body);
+    body.on("error", (e) => req.destroy(e));
+    body.pipe(req);
+  });
+}
+
+function bodyText(text) {
+  return String(text || "").replace(/\s+/g, " ").trim().slice(0, HUB_BODY_LOG_MAX);
+}
+
+/**
+ * Deliver to the backend with the job's upload token. Retries ONLY network
+ * errors / 5xx (up to V3_DELIVERY_ATTEMPTS, backoff 1→2→4→8 s, cap 15 s);
+ * 409 (not the current attempt any more) / 401 (token) and every other 4xx
+ * stop at once — the job is dropped, the backend has already decided.
+ * → { ok, status, attempts, stopped? }
+ */
+async function deliverV3(what, url, method, token, makeBody, extraHeaders = {}) {
+  let delay = V3_DELIVERY_BACKOFF_MS;
+  for (let attempt = 1; attempt <= V3_DELIVERY_ATTEMPTS; attempt++) {
+    let r = null;
+    let netErr = null;
+    try {
+      const { body, headers } = await makeBody();
+      r = await httpSend(url, method, { Authorization: `Bearer ${token}`, ...extraHeaders, ...headers }, body);
+    } catch (err) {
+      netErr = err;
+    }
+    if (r && r.status >= 200 && r.status < 300) return { ok: true, status: r.status, attempts: attempt };
+    if (r && r.status < 500) {
+      const why = r.status === 409 ? "not the current attempt (409)" : r.status === 401 ? "upload token rejected (401)" : `HTTP ${r.status}`;
+      log("warn", `${what} rejected: ${why} — dropping the job${r.text ? `: ${bodyText(r.text)}` : ""}`);
+      return { ok: false, status: r.status, attempts: attempt, stopped: true };
+    }
+    const reason = r ? `HTTP ${r.status}${r.text ? ` ${bodyText(r.text)}` : ""}` : (netErr && netErr.message) || String(netErr);
+    if (attempt === V3_DELIVERY_ATTEMPTS) {
+      log("error", `${what} failed after ${attempt} attempt(s): ${reason}`);
+      return { ok: false, status: r ? r.status : null, attempts: attempt };
+    }
+    log("warn", `${what} attempt ${attempt}/${V3_DELIVERY_ATTEMPTS} failed: ${reason} — retry in ${delay}ms`);
+    await sleep(delay);
+    delay = Math.min(delay * 2, 15000);
+  }
+  return { ok: false, status: null, attempts: V3_DELIVERY_ATTEMPTS };
+}
+
+async function putResultV3(task, src) {
+  return deliverV3(`Result PUT ${task.job_id}#${task.attempt}`, task.upload_url, "PUT", task.upload_token, async () => {
+    if (src.kind === "buffer") {
+      return { body: src.buffer, headers: { "Content-Type": src.contentType, "Content-Length": String(src.size) } };
+    }
+    if (src.kind === "file") {
+      const st = await fsp.stat(src.path);
+      return { body: fs.createReadStream(src.path), headers: { "Content-Type": src.contentType, "Content-Length": String(st.size) } };
+    }
+    const g = await openHttpGetStream(src.url);
+    const headers = { "Content-Type": src.contentType };
+    if (g.size) headers["Content-Length"] = String(g.size);
+    return { body: g.stream, headers };
+  });
+}
+
+async function sendErrorV3(task, reason, meta = {}) {
+  if (!task.error_url || !task.upload_token) {
+    log("error", `Cannot report error for ${task.job_id}: task has no error_url / upload_token`);
+    return { ok: false };
+  }
+  const payload = { reason: String(reason || "worker_error").slice(0, 500), worker_version: WORKER_VERSION };
+  payload.error_class = meta.errorClass || null;
+  if (Number.isInteger(meta.comfyStatus)) payload.comfy_status = meta.comfyStatus;
+  const json = JSON.stringify(payload);
+  return deliverV3(`Error report ${task.job_id}#${task.attempt}`, task.error_url, "POST", task.upload_token, async () => ({
+    body: json, headers: { "Content-Type": "application/json", "Content-Length": String(Buffer.byteLength(json)) },
+  }));
+}
+
+function v3TaskProblem(task) {
+  if (task.protocol_version !== V3_PROTOCOL_VERSION) return `protocol_version=${task.protocol_version || "missing"}`;
+  if (!task.job_id || !Number.isInteger(task.attempt)) return "job_id / attempt missing";
+  if (!task.upload_url || !task.upload_token) return "upload_url / upload_token missing";
+  if (!task.params || typeof task.params !== "object") return "params missing";
+  return null;
+}
+
+async function runV3Task(task) {
+  const problem = v3TaskProblem(task);
+  if (problem) {
+    log("error", `Rejecting incompatible protocol-3 task ${task.job_id || "?"}: ${problem}`);
+    await sendErrorV3(task, `incompatible_task_protocol:${problem}`, { errorClass: "deterministic" });
+    return;
+  }
+  const jobId = task.job_id;
+  const dispatchId = `v3.${task.attempt}`;
+  const job = { jobId, attempt: task.attempt, cancelled: false, promptId: null };
+  currentV3 = job;
+  log("info", `Task ${jobId} attempt ${task.attempt} (protocol 3, kind=${task.kind || "?"}, type=${WORKER_TYPE}, timeout_ms=${task.timeout_ms || "default"})`);
+  // report the job right away (current_job_id) instead of waiting up to 10 s
+  sendBeaconV3().catch(() => {});
+
+  let outputPath = null;
+  let delivered = false;
+  try {
+    await journal.createJob({ jobId, dispatchId, log });
+    job.promptId = await runWorkflow(task.params);
+    if (job.cancelled) {
+      await interruptComfy(job.promptId, "cancel");
+      throw cancelledError();
+    }
+    let result;
+    try {
+      // I3: timeout_ms only bounds how long we wait / when we interrupt ComfyUI;
+      // the status belongs to the backend (deadline in gen_jobs).
+      result = await waitResult(job.promptId, task.params, task.timeout_ms, {
+        shouldAbort: () => job.cancelled,
+        timeoutErrorClass: "timeout",
+      });
+    } catch (err) {
+      if (err && err.errorClass === "timeout") await interruptComfy(job.promptId, "timeout");
+      throw err;
+    }
+    if (result.meta && result.meta.filename) {
+      outputPath = path.resolve(COMFY_OUTPUT_DIR, result.meta.subfolder || "", result.meta.filename);
+      await journal.setOutputAndGenerated({ jobId, dispatchId, log }, outputPath);
+    }
+    if (job.cancelled) throw cancelledError();
+    const src = await resultSource(result);
+    log("debug", `result for ${jobId}: ${src.label}, ${src.size != null ? Math.round(src.size / 1024) + "KB" : "size unknown"}, ${src.contentType}`);
+    const r = await putResultV3(task, src);
+    if (r.ok) {
+      await journal.setDelivered({ jobId, dispatchId, log });
+      delivered = true;
+      log("info", `Done ${jobId} (protocol 3, HTTP ${r.status}, ${r.attempts} attempt(s))`);
+    } else if (r.stopped) {
+      // the backend refused this attempt — the output is not needed any more
+      delivered = true;
+    }
+  } catch (err) {
+    if (err && err.cancelled) {
+      log("info", `Job ${jobId} stopped: cancelled — no upload, no error report`);
+      delivered = true;   // nothing to keep for a cancelled job
+    } else {
+      log("error", `Failed ${jobId}`, err && err.message || err);
+      await sendErrorV3(task, err && err.message || err || "worker_error", {
+        errorClass: err && err.errorClass,
+        comfyStatus: err && err.comfyStatus,
+      });
+    }
+  } finally {
+    if (currentV3 === job) currentV3 = null;
+    try {
+      const toCleanOutput = delivered ? outputPath : null;
+      const cleanupResult = await cleanupJobArtifacts({ inputFiles: [], outputFile: toCleanOutput });
+      for (const f of cleanupResult.failed) log("warn", `Cleanup ${jobId}: failed to remove ${f.path}: ${f.reason}`);
+      if (cleanupResult.failed.length === 0) await journal.removeJob({ jobId, dispatchId, log });
+    } catch (cleanupErr) {
+      log("warn", `Cleanup ${jobId}: error: ${cleanupErr.message}`);
+    }
+  }
+}
+
+// ======================================================
 // LOOP (with backoff on empty queue)
 // ======================================================
 
 let emptyQueueDelay = TASK_SLEEP_MS;
 
+function beaconTick() {
+  const gpu = getGPUInfo();
+  sendBeacon(gpu);
+  if (WORKER_PROTOCOL !== "v2only") sendBeaconV3(gpu);
+}
+
 async function workerLoop() {
   // First heartbeat right away (not after BEACON_INTERVAL_MS): the worker
   // shows ONLINE as soon as it is actually serving.
-  sendBeacon();
-  setInterval(sendBeacon, BEACON_INTERVAL_MS);
+  log("info", `Protocol mode: ${WORKER_PROTOCOL === "v2only" ? "v2only (no /v3 calls)" : "both (v3 relay first, then v2)"}`);
+  beaconTick();
+  setInterval(beaconTick, BEACON_INTERVAL_MS);
 
   while (true) {
     if (nodeReadinessStale) {
       nodeReadinessStale = false;
       await waitForNodeClasses();
+    }
+    // 2.4.0: one v3 relay call, then ONE v2 pop; sleep only when both are empty.
+    const v3task = WORKER_PROTOCOL === "v2only" ? null : await getTaskV3();
+    if (v3task) {
+      emptyQueueDelay = TASK_SLEEP_MS;
+      await runV3Task(v3task);
+      continue;
     }
     const task = await getTask();
 
@@ -797,132 +1144,136 @@ async function workerLoop() {
       continue;
     }
     emptyQueueDelay = TASK_SLEEP_MS; // reset on task received
+    await runV2Task(task);
+  }
+}
 
-    log("info", `Task ${task.job_id} (type=${WORKER_TYPE}, timeout_ms=${task.timeout_ms || 'default'})`);
+/** One protocol-2 task — exactly the 2.3.0 handling. */
+async function runV2Task(task) {
+  log("info", `Task ${task.job_id} (type=${WORKER_TYPE}, timeout_ms=${task.timeout_ms || 'default'})`);
 
-    if (task.protocol_version !== PROTOCOL_VERSION || !task.dispatch_id) {
-      const reason = `incompatible_task_protocol:${task.protocol_version || 'missing'}`;
-      log("error", `Rejecting incompatible task: protocol=${task.protocol_version}, dispatch=${task.dispatch_id || 'missing'}`);
-      if (task.job_id && task.build_id && task.dispatch_id) {
-        try {
-          await sendTaskError(task, reason, { errorClass: "deterministic" });
-        } catch (sendErr) {
-          log("error", "Failed to report incompatible task", sendErr.message);
-        }
+  if (task.protocol_version !== PROTOCOL_VERSION || !task.dispatch_id) {
+    const reason = `incompatible_task_protocol:${task.protocol_version || 'missing'}`;
+    log("error", `Rejecting incompatible task: protocol=${task.protocol_version}, dispatch=${task.dispatch_id || 'missing'}`);
+    if (task.job_id && task.build_id && task.dispatch_id) {
+      try {
+        await sendTaskError(task, reason, { errorClass: "deterministic" });
+      } catch (sendErr) {
+        log("error", "Failed to report incompatible task", sendErr.message);
       }
-      await sleep(TASK_SLEEP_MS);
-      continue;
     }
+    await sleep(TASK_SLEEP_MS);
+    return;
+  }
 
-    // ── Per-job artifact tracking (cleanup after job) ──
-    // Точечная уборка: удаляются ТОЛЬКО файлы этой job. Output удаляется
-    // только после успешной доставки результата (downloadResult + sendResult),
-    // чтобы при ошибке sendResult() единственный результат не потерялся.
-    // Journal (worker-local persistent) фиксирует lifecycle
-    // CREATED→GENERATED→DELIVERED→CLEANED, чтобы после crash restart мог
-    // дочистить файлы job, результат которой уже доставлен в hub.
-    const createdInputFiles = [];
-    let outputPath = null;
-    let outputDelivered = false;
-    const jobId = task.job_id;
-    const dispatchId = task.dispatch_id;
+  // ── Per-job artifact tracking (cleanup after job) ──
+  // Точечная уборка: удаляются ТОЛЬКО файлы этой job. Output удаляется
+  // только после успешной доставки результата (downloadResult + sendResult),
+  // чтобы при ошибке sendResult() единственный результат не потерялся.
+  // Journal (worker-local persistent) фиксирует lifecycle
+  // CREATED→GENERATED→DELIVERED→CLEANED, чтобы после crash restart мог
+  // дочистить файлы job, результат которой уже доставлен в hub.
+  const createdInputFiles = [];
+  let outputPath = null;
+  let outputDelivered = false;
+  const jobId = task.job_id;
+  const dispatchId = task.dispatch_id;
 
-    try {
-      // Journal: CREATED — создаётся ДО первого временного input-файла.
-      await journal.createJob({ jobId, dispatchId, log });
+  try {
+    // Journal: CREATED — создаётся ДО первого временного input-файла.
+    await journal.createJob({ jobId, dispatchId, log });
 
-      if (task.assets?.images) {
-        const [jobBase] = task.job_id.split(JOB_ID_SPLIT_RE);
-        const scenePrefix = jobBase.replace(/_g\d+$/, '');
-        for (const [unitId, base64] of Object.entries(task.assets.images)) {
-          const filename = `${scenePrefix}_${unitId}.png`;
-          const filePath = path.join(COMFY_INPUT_DIR, filename);
-          createdInputFiles.push(filePath);
-          const { expectedSize } = await saveBase64ImageSafe(base64, filename);
-          // Journal: каждый фактически созданный reference image.
-          await journal.addInputFile({ jobId, dispatchId, log }, filePath);
-          log("info", `Multi-image saved: ${filename}`);
-          await waitForFileReady(filePath, expectedSize);
-          log("info", `Multi-image ready: ${filename}`);
-        }
-      } else if (task.assets?.image) {
-        const [baseId] = task.job_id.split(JOB_ID_SPLIT_RE);
-        const filename = `${baseId}.png`;
+    if (task.assets?.images) {
+      const [jobBase] = task.job_id.split(JOB_ID_SPLIT_RE);
+      const scenePrefix = jobBase.replace(/_g\d+$/, '');
+      for (const [unitId, base64] of Object.entries(task.assets.images)) {
+        const filename = `${scenePrefix}_${unitId}.png`;
         const filePath = path.join(COMFY_INPUT_DIR, filename);
         createdInputFiles.push(filePath);
-        const { expectedSize } = await saveBase64ImageSafe(task.assets.image, filename);
+        const { expectedSize } = await saveBase64ImageSafe(base64, filename);
+        // Journal: каждый фактически созданный reference image.
         await journal.addInputFile({ jobId, dispatchId, log }, filePath);
-        log("info", `Image saved: ${filename}`);
+        log("info", `Multi-image saved: ${filename}`);
         await waitForFileReady(filePath, expectedSize);
-        log("info", `Image ready: ${filename}`);
+        log("info", `Multi-image ready: ${filename}`);
+      }
+    } else if (task.assets?.image) {
+      const [baseId] = task.job_id.split(JOB_ID_SPLIT_RE);
+      const filename = `${baseId}.png`;
+      const filePath = path.join(COMFY_INPUT_DIR, filename);
+      createdInputFiles.push(filePath);
+      const { expectedSize } = await saveBase64ImageSafe(task.assets.image, filename);
+      await journal.addInputFile({ jobId, dispatchId, log }, filePath);
+      log("info", `Image saved: ${filename}`);
+      await waitForFileReady(filePath, expectedSize);
+      log("info", `Image ready: ${filename}`);
+    }
+
+    const prompt_id = await runWorkflow(task.params);
+    // timeout_ms приходит с задачей (backend → gpu-hub → worker): per-job
+    // таймаут для данного типа генерации. Если нет — per-type fallback.
+    const result = await waitResult(prompt_id, task.params, task.timeout_ms);
+
+    // Точечный output этой job: COMFY_OUTPUT_DIR + subfolder + filename.
+    // Это именно тот файл, который waitResult выбрал как результат (в т.ч.
+    // для video — реально выбранный mp4 из history/fallback/fs-scan).
+    if (result.meta && result.meta.filename) {
+      outputPath = path.resolve(COMFY_OUTPUT_DIR, result.meta.subfolder || "", result.meta.filename);
+      // Journal: GENERATED — известен конкретный output-файл.
+      await journal.setOutputAndGenerated({ jobId, dispatchId, log }, outputPath);
+    }
+
+    const base64 = await downloadResult(result);
+    log("debug", `result for ${task.job_id}: type=${result.type} size=${Math.round(base64.length / 1024)}KB`);
+    await sendResult(task, base64);
+    // Journal: DELIVERED — HTTP 200 от hub = результат уже durable в hub
+    // Redis (animastor:result:* записан до ответа 200). Output можно удалять.
+    await journal.setDelivered({ jobId, dispatchId, log });
+    outputDelivered = true;
+    log("info", `Done ${task.job_id}`);
+
+  } catch (err) {
+    log("error", `Failed ${task.job_id}`, err.message);
+
+    try {
+      await sendTaskError(task, err && err.message || err || "worker_error", {
+        errorClass: err && err.errorClass,
+        comfyStatus: err && err.comfyStatus
+      });
+    } catch (sendErr) {
+      log("error", "Failed to send error to hub", sendErr.message);
+    }
+  } finally {
+    // Cleanup after job: только собственные временные файлы этой job.
+    // Output — ТОЛЬКО после успешной доставки результата; при ошибке
+    // downloadResult()/sendResult() output сохраняется.
+    try {
+      const toCleanOutput = outputDelivered ? outputPath : null;
+      const cleanupResult = await cleanupJobArtifacts({
+        inputFiles: createdInputFiles,
+        outputFile: toCleanOutput,
+      });
+
+      if (cleanupResult.cleaned > 0 || cleanupResult.failed.length > 0) {
+        log("info",
+          `Cleanup ${task.job_id}: removed ${cleanupResult.cleaned} artifact(s) ` +
+          `(${createdInputFiles.length} input, ${toCleanOutput ? "1 output" : "0 output"})`);
+      }
+      for (const f of cleanupResult.failed) {
+        log("warn", `Cleanup ${task.job_id}: failed to remove ${f.path}: ${f.reason}`);
       }
 
-      const prompt_id = await runWorkflow(task.params);
-      // timeout_ms приходит с задачей (backend → gpu-hub → worker): per-job
-      // таймаут для данного типа генерации. Если нет — per-type fallback.
-      const result = await waitResult(prompt_id, task.params, task.timeout_ms);
-
-      // Точечный output этой job: COMFY_OUTPUT_DIR + subfolder + filename.
-      // Это именно тот файл, который waitResult выбрал как результат (в т.ч.
-      // для video — реально выбранный mp4 из history/fallback/fs-scan).
-      if (result.meta && result.meta.filename) {
-        outputPath = path.resolve(COMFY_OUTPUT_DIR, result.meta.subfolder || "", result.meta.filename);
-        // Journal: GENERATED — известен конкретный output-файл.
-        await journal.setOutputAndGenerated({ jobId, dispatchId, log }, outputPath);
+      if (cleanupResult.failed.length === 0) {
+        // CLEANED: все файлы job удалены → journal больше не нужен.
+        await journal.removeJob({ jobId, dispatchId, log });
+      } else {
+        // Частичный cleanup: journal остаётся — следующий recovery дочистит
+        // оставшиеся файлы (например, один input из видео-набора).
+        log("warn", `Cleanup ${task.job_id}: partial cleanup (${cleanupResult.failed.length} failed) — journal kept for recovery`);
       }
-
-      const base64 = await downloadResult(result);
-      log("debug", `result for ${task.job_id}: type=${result.type} size=${Math.round(base64.length / 1024)}KB`);
-      await sendResult(task, base64);
-      // Journal: DELIVERED — HTTP 200 от hub = результат уже durable в hub
-      // Redis (animastor:result:* записан до ответа 200). Output можно удалять.
-      await journal.setDelivered({ jobId, dispatchId, log });
-      outputDelivered = true;
-      log("info", `Done ${task.job_id}`);
-
-    } catch (err) {
-      log("error", `Failed ${task.job_id}`, err.message);
-
-      try {
-        await sendTaskError(task, err && err.message || err || "worker_error", {
-          errorClass: err && err.errorClass,
-          comfyStatus: err && err.comfyStatus
-        });
-      } catch (sendErr) {
-        log("error", "Failed to send error to hub", sendErr.message);
-      }
-    } finally {
-      // Cleanup after job: только собственные временные файлы этой job.
-      // Output — ТОЛЬКО после успешной доставки результата; при ошибке
-      // downloadResult()/sendResult() output сохраняется.
-      try {
-        const toCleanOutput = outputDelivered ? outputPath : null;
-        const cleanupResult = await cleanupJobArtifacts({
-          inputFiles: createdInputFiles,
-          outputFile: toCleanOutput,
-        });
-
-        if (cleanupResult.cleaned > 0 || cleanupResult.failed.length > 0) {
-          log("info",
-            `Cleanup ${task.job_id}: removed ${cleanupResult.cleaned} artifact(s) ` +
-            `(${createdInputFiles.length} input, ${toCleanOutput ? "1 output" : "0 output"})`);
-        }
-        for (const f of cleanupResult.failed) {
-          log("warn", `Cleanup ${task.job_id}: failed to remove ${f.path}: ${f.reason}`);
-        }
-
-        if (cleanupResult.failed.length === 0) {
-          // CLEANED: все файлы job удалены → journal больше не нужен.
-          await journal.removeJob({ jobId, dispatchId, log });
-        } else {
-          // Частичный cleanup: journal остаётся — следующий recovery дочистит
-          // оставшиеся файлы (например, один input из видео-набора).
-          log("warn", `Cleanup ${task.job_id}: partial cleanup (${cleanupResult.failed.length} failed) — journal kept for recovery`);
-        }
-      } catch (cleanupErr) {
-        // Cleanup никогда не должен маскировать исходную ошибку job.
-        log("warn", `Cleanup ${task.job_id}: error: ${cleanupErr.message}`);
-      }
+    } catch (cleanupErr) {
+      // Cleanup никогда не должен маскировать исходную ошибку job.
+      log("warn", `Cleanup ${task.job_id}: error: ${cleanupErr.message}`);
     }
   }
 }
