@@ -1,6 +1,14 @@
 // ======================================================
-// GPU Worker - v2.4.0 (protocol 3: pull via hub /v3, PUT result stream, cancel from beacon; v2 compat)
+// GPU Worker - v2.4.1 (protocol 3 + fresh worker logs: ring buffer, redaction, hub /v3/logs)
 // ======================================================
+// 2.4.1 (ORCHESTRATION_V2 §8.5): every line the worker logger writes (plus
+// the stderr of a ComfyUI THIS worker started) also goes into a bounded
+// in-memory ring (2000 lines / 256 KiB). Every 30 s only the new lines are
+// POSTed gzip'd to the hub /v3/logs (Bearer, ≤ 64 KiB per body, secrets
+// scrubbed BEFORE sending); errors are silent and the lines stay buffered.
+// The task loop never waits for the sender. WORKER_LOG_SHIP=on|off (default
+// on). `send_log_tail:true` in a /v3/beacon answer triggers a one-shot flush
+// of the whole buffer in 64 KiB chunks. See worker-logs.cjs.
 // 2.4.0 (ORCHESTRATION_V2 §8, stage 1c): every loop iteration asks the hub
 // relay GET /v3/task/next first; on {task:null} / 404 / 503 (old hub, backend
 // off) it makes ONE v2 /task/next pop exactly as 2.3.0. A protocol-3 task's
@@ -17,7 +25,7 @@
 //   packages/animastor-worker/worker/job-protocol-v2.cjs  (regenerate: node packages/animastor-worker/tools/sync-protocol.cjs)
 // It is byte-parity guarded against the canonical source — never edit it.
 
-const { execSync } = require("child_process");
+const { execSync, spawn } = require("child_process");
 const os = require("os");
 const fs = require("fs");
 const fsp = require("fs").promises;
@@ -28,6 +36,7 @@ const { cleanupJobArtifacts } = require("./worker-cleanup.cjs");
 const journal = require("./worker-cleanup-journal.cjs");
 const { loadDotEnv } = require("./worker-env.cjs");
 const { PROTOCOL_VERSION, JOB_ID_SPLIT_RE } = require("./job-protocol-v2.cjs");
+const { createLogBuffer, createLogShipper, captureStream } = require("./worker-logs.cjs");
 
 // Bundle self-containment: load ./.env next to the worker (cp .env.example
 // .env). Real environment variables always win over the file.
@@ -97,13 +106,41 @@ const V3_UPLOAD_IDLE_MS = Number(process.env.V3_UPLOAD_IDLE_MS || 120000);
 const COMFY_INPUT_DIR = process.env.COMFY_INPUT_DIR || "/home/jovyan/ComfyUI/input";
 const COMFY_OUTPUT_DIR = path.resolve(COMFY_INPUT_DIR, "../output");
 
+// 2.4.1 (ORCHESTRATION_V2 §8.5): fresh logs to the hub.
+//   WORKER_LOG_SHIP=on|off   (default on) — the whole shipping feature.
+//   LOG_SHIP_INTERVAL_MS=30000 — only NEW lines with each tick.
+//   LOG_SHIP_MAX_BYTES, LOG_SHIP_TIMEOUT_MS — one body / one request.
+const WORKER_LOG_SHIP = !/^(off|0|false|no)$/i.test(String(process.env.WORKER_LOG_SHIP || "on").trim());
+const LOG_SHIP_INTERVAL_MS = Number(process.env.LOG_SHIP_INTERVAL_MS || 30000);
+const LOG_SHIP_MAX_BYTES = Number(process.env.LOG_SHIP_MAX_BYTES || 64 * 1024);
+const LOG_SHIP_TIMEOUT_MS = Number(process.env.LOG_SHIP_TIMEOUT_MS || 5000);
+// Optional: this worker starts ComfyUI itself and ships its stderr. In the
+// shipped deployments ComfyUI is started by the installer, so unset = OFF.
+const COMFY_SPAWN_CMD = process.env.COMFY_SPAWN_CMD || null;
+
+// The ring buffer holds every logger line (and ComfyUI stderr, when spawned
+// here). It is process-local memory only — nothing is written to disk.
+const logBuffer = createLogBuffer();
+// Both the worker credential and any configured spawn command are scrubbed
+// from every shipped line (belt-and-braces next to the pattern rules).
+const LOG_SECRETS = [ANIMASTOR_WORKER_TOKEN].filter(Boolean);
+// Created lazily in startLogShipping() so tests can import this file without
+// touching the network.
+let logShipper = null;
+
 // ======================================================
 // UTILS
 // ======================================================
 
 function log(level, msg, data) {
-  console.log(`[${new Date().toISOString()}] [${level}] ${msg}`);
-  if (data !== undefined) console.log(typeof data === 'string' ? data : JSON.stringify(data, null, 2));
+  const line = `[${new Date().toISOString()}] [${level}] ${msg}`;
+  console.log(line);
+  logBuffer.append(level, msg);
+  if (data !== undefined) {
+    const extra = typeof data === 'string' ? data : JSON.stringify(data, null, 2);
+    console.log(extra);
+    logBuffer.append(level, extra);
+  }
 }
 
 function sleep(ms) {
@@ -354,6 +391,63 @@ async function waitForNodeClasses() {
 let nodeReadinessStale = false;
 // The "no class list" warning is printed once per process.
 let noListWarned = false;
+
+// ======================================================
+// LOG SHIPPING (bundle 2.4.1, ORCHESTRATION_V2 §8.5)
+// ======================================================
+
+/**
+ * Create the incremental shipper and start its 30 s tick. The tick callback
+ * is not awaited anywhere: shipping can never delay the task loop.
+ */
+function startLogShipping() {
+  if (!WORKER_LOG_SHIP) {
+    log("info", "Worker log shipping: disabled (WORKER_LOG_SHIP=off)");
+    return;
+  }
+  logShipper = createLogShipper({
+    buffer: logBuffer,
+    hubUrl: HUB_URL,
+    token: ANIMASTOR_WORKER_TOKEN,
+    workerId: WORKER_ID,
+    intervalMs: LOG_SHIP_INTERVAL_MS,
+    maxBytes: LOG_SHIP_MAX_BYTES,
+    timeoutMs: LOG_SHIP_TIMEOUT_MS,
+    secrets: LOG_SECRETS,
+  });
+  logShipper.start();
+  log("info", `Worker log shipping: on (every ${Math.round(LOG_SHIP_INTERVAL_MS / 1000)} s, ≤ ${Math.round(LOG_SHIP_MAX_BYTES / 1024)} KiB gzip per POST)`);
+}
+
+/** One-shot full-buffer flush requested by the backend (send_log_tail). */
+function shipLogTail() {
+  if (!WORKER_LOG_SHIP || !logShipper) return;
+  log("info", "Log tail requested by the backend — flushing the buffer");
+  logShipper.shipAll().then((r) => {
+    if (r && r.sent) log("info", `Log tail sent: ${r.sent} line(s)`);
+  }).catch(() => { /* silent by contract */ });
+}
+
+/**
+ * Optional: this worker starts ComfyUI itself. Its stdout/stderr then join the
+ * same ring buffer, so a fresh log line from ComfyUI reaches the hub too.
+ * In the shipped deployments ComfyUI is started by the installer/start-worker,
+ * so COMFY_SPAWN_CMD is normally unset and this is a no-op.
+ */
+let comfyChild = null;
+function maybeStartComfyChild() {
+  if (!COMFY_SPAWN_CMD) return;
+  try {
+    comfyChild = spawn(COMFY_SPAWN_CMD, { shell: true, stdio: ["ignore", "pipe", "pipe"] });
+    log("info", "ComfyUI spawned by the worker — its output joins the log buffer");
+    captureStream(comfyChild.stdout, logBuffer, { level: "comfy" });
+    captureStream(comfyChild.stderr, logBuffer, { level: "comfy" });
+    comfyChild.on("error", (err) => log("error", "ComfyUI spawn failed", err && err.message || err));
+    comfyChild.on("exit", (code, signal) => log("warn", `ComfyUI exited (code=${code}, signal=${signal || "-"})`));
+  } catch (err) {
+    log("error", "ComfyUI spawn failed", err && err.message || err);
+  }
+}
 
 // ======================================================
 // BEACON
@@ -855,6 +949,9 @@ async function sendBeaconV3(gpuSnapshot) {
     }
     if (!res.ok) return;          // old hub (404) / backend off (503): the v2 beacon still runs
     const data = await res.json().catch(() => ({}));
+    // 2.4.1 (§8.5): the backend asked ONCE for the whole log buffer. The flush
+    // is fire-and-forget — the task loop is never blocked by log shipping.
+    if (data && data.send_log_tail === true) shipLogTail();
     const cancel = Array.isArray(data && data.cancel) ? data.cancel : [];
     if (job && !job.cancelled && cancel.includes(job.jobId) && currentV3 === job) {
       job.cancelled = true;
@@ -1302,6 +1399,11 @@ async function main() {
   log("info", `Worker image tag: ${WORKER_IMAGE_TAG || 'unknown'}`);
   log("info", `Hub URL: ${HUB_URL}`);
   log("info", `Protocol version: ${PROTOCOL_VERSION}`);
+
+  // 2.4.1: fresh logs. Shipping starts before the readiness gates so startup
+  // diagnostics are not lost; the tick is fire-and-forget.
+  startLogShipping();
+  maybeStartComfyChild();
 
   // Confirm identity + mode against the registry before doing any work.
   await verifyCredential();
