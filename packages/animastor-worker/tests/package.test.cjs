@@ -22,6 +22,7 @@ const RUNTIME_FILES = [
     'worker-env.cjs',
     'worker-cleanup.cjs',
     'worker-cleanup-journal.cjs',
+    'worker-logs.cjs',
     'job-protocol-v2.cjs',
     'package.json',
     'package-lock.json',

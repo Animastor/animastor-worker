@@ -285,7 +285,7 @@ describe('worker 2.4.0 — protocol 3 cycle', () => {
         expect.equal(r.st.puts.length, 0);
         expect.equal(r.st.errors.length, 0);
         const b = r.st.v3beacons[0];
-        expect.ok('gpu' in b && 'vram' in b && b.version === '2.4.0', `beacon body: ${JSON.stringify(b)}`);
+        expect.ok('gpu' in b && 'vram' in b && b.version === '2.4.1', `beacon body: ${JSON.stringify(b)}`);
         // after the cancel the loop goes on: v3 then v2 again
         const after = r.st.hub.slice(r.st.hub.lastIndexOf('GET /v3/task/next'));
         expect.ok(r.st.hub.filter((h) => h === 'GET /v3/task/next').length >= 2, 'next iteration started');
