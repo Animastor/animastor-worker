@@ -289,7 +289,7 @@ describe('ComfyUI stderr capture (worker-started ComfyUI)', () => {
     });
 });
 
-describe('worker.cjs wiring (bundle 2.4.1)', () => {
+describe('worker.cjs wiring (bundle 2.5.0)', () => {
     const src = fs.readFileSync(path.join(__dirname, '..', 'worker', 'worker.cjs'), 'utf8');
     it('honours WORKER_LOG_SHIP and handles send_log_tail', () => {
         expect.include(src, 'WORKER_LOG_SHIP');
@@ -301,8 +301,8 @@ describe('worker.cjs wiring (bundle 2.4.1)', () => {
         expect.include(src, 'logBuffer.append(level, msg)');
         expect.include(src, 'createLogBuffer()');
     });
-    it('the bundle version is 2.4.1', () => {
+    it('the bundle version is 2.5.0', () => {
         const pkg = require(path.join(__dirname, '..', 'worker', 'package.json'));
-        expect.equal(pkg.version, '2.4.1');
+        expect.equal(pkg.version, '2.5.0');
     });
 });

@@ -64,6 +64,7 @@ async function fakeComfy(opts, st) {
         if (req.url === '/system_stats') return json(res, 200, { system: {}, devices: [] });
         if (req.url === '/prompt' && req.method === 'POST') {
             st.prompts.push(JSON.parse(body.toString() || '{}'));
+            if (st.inputDir) st.inputsAtPrompt = fs.existsSync(st.inputDir) ? fs.readdirSync(st.inputDir).sort() : [];
             if (opts.prompt === 'reject') return json(res, 400, { error: { type: 'invalid_prompt', message: 'node QwenTTS does not exist' }, node_errors: {} });
             return json(res, 200, { prompt_id: `p-${st.prompts.length}`, number: 1, node_errors: {} });
         }
@@ -93,6 +94,17 @@ async function fakeBackend(opts, st) {
     return listen(async (req, res) => {
         if (opts.dropConnections) { req.socket.destroy(); st.puts.push({ dropped: true }); return; }
         const body = await readBody(req);
+        // 2.5.0: GET input/:name (video frames by link)
+        const m = req.method === 'GET' && req.url.match(/\/input\/([^?]+)\?attempt=(\d+)$/);
+        if (m) {
+            st.inputGets.push({ name: decodeURIComponent(m[1]), auth: req.headers.authorization });
+            const status = (opts.inputStatuses && opts.inputStatuses.length) ? opts.inputStatuses.shift() : 200;
+            if (status !== 200) return json(res, status, { code: opts.inputCode || `s${status}` });
+            const buf = (opts.inputs || {})[decodeURIComponent(m[1])];
+            if (!buf) return json(res, 404, { code: 'not_found' });
+            res.writeHead(200, { 'Content-Type': 'image/png', 'Content-Length': buf.length });
+            return res.end(buf);
+        }
         const rec = { method: req.method, url: req.url, headers: req.headers, size: body.length, sha: sha(body), text: body.length < 4096 ? body.toString() : null };
         if (req.method === 'PUT') {
             st.puts.push(rec);
@@ -119,11 +131,16 @@ async function fakeHub(opts, st, backendPort) {
             if (opts.v3 === 'task' && !v3Served) {
                 v3Served = true;
                 const base = `http://127.0.0.1:${backendPort}/internal/gen/jobs/${JOB}`;
+                const inputFiles = opts.inputs ? Object.entries(opts.inputs).map(([name, buf]) => ({
+                    name, sha256: opts.badSha ? sha(Buffer.from('other')) : sha(buf), bytes: buf.length,
+                    url: `${base}/input/${encodeURIComponent(name)}?attempt=1`,
+                })) : undefined;
                 return json(res, 200, { task: {
                     job_id: JOB, attempt: 1, kind: 'audio_chunk', protocol_version: 3, job_type: 'audio',
                     params: { '3': { class_type: 'SaveAudio', inputs: { filename_prefix: 'audio/v3' } } },
                     timeout_ms: opts.timeoutMs || 60000,
                     upload_token: TOKEN, upload_url: `${base}/result?attempt=1`, error_url: `${base}/error?attempt=1`,
+                    ...(inputFiles ? { input_files: inputFiles } : {}),
                 } });
             }
             return json(res, 200, { task: null });
@@ -155,12 +172,13 @@ async function until(fn, ms) {
 }
 
 async function scenario(opts, doneWhen, timeoutMs = 20000) {
-    const st = { comfy: [], prompts: [], interrupts: [], views: 0, puts: [], errors: [], hub: [], v3beacons: [], v2results: [], v2errors: [] };
+    const st = { comfy: [], prompts: [], interrupts: [], views: 0, puts: [], errors: [], hub: [], v3beacons: [], v2results: [], v2errors: [], inputGets: [], inputDir: null, inputsAtPrompt: null };
     const comfy = await fakeComfy(opts, st);
     const backend = await fakeBackend(opts, st);
     const hub = await fakeHub(opts, st, backend.address().port);
     const dir = copyBundle();
     const outDir = path.join(dir, 'ComfyUI', 'output');
+    st.inputDir = path.join(dir, 'ComfyUI', 'input');
     fs.mkdirSync(path.join(outDir, 'audio'), { recursive: true });
     if (opts.onDisk !== false) fs.writeFileSync(path.join(outDir, 'audio', 'v3_00001_.mp3'), AUDIO);
     const out = { text: '' };
@@ -185,7 +203,8 @@ async function scenario(opts, doneWhen, timeoutMs = 20000) {
     try {
         const ok = await until(() => doneWhen(st, out.text), timeoutMs);
         if (opts.settleMs) await sleep(opts.settleMs);
-        return { ok, st, out: out.text, outputLeft: fs.existsSync(path.join(outDir, 'audio', 'v3_00001_.mp3')) };
+        const inputsLeft = fs.existsSync(st.inputDir) ? fs.readdirSync(st.inputDir) : [];
+        return { ok, st, out: out.text, outputLeft: fs.existsSync(path.join(outDir, 'audio', 'v3_00001_.mp3')), inputsLeft };
     } finally {
         child.kill('SIGKILL');
         comfy.close(); backend.close(); hub.close();
@@ -285,7 +304,7 @@ describe('worker 2.4.0 — protocol 3 cycle', () => {
         expect.equal(r.st.puts.length, 0);
         expect.equal(r.st.errors.length, 0);
         const b = r.st.v3beacons[0];
-        expect.ok('gpu' in b && 'vram' in b && b.version === '2.4.1', `beacon body: ${JSON.stringify(b)}`);
+        expect.ok('gpu' in b && 'vram' in b && b.version === '2.5.0', `beacon body: ${JSON.stringify(b)}`);
         // after the cancel the loop goes on: v3 then v2 again
         const after = r.st.hub.slice(r.st.hub.lastIndexOf('GET /v3/task/next'));
         expect.ok(r.st.hub.filter((h) => h === 'GET /v3/task/next').length >= 2, 'next iteration started');
@@ -347,3 +366,48 @@ describe('worker 2.4.0 — v2 compatibility', () => {
         expect.equal(r.st.v3beacons[0].current_job_id, null);
     });
 });
+
+describe('worker 2.5.0 — protocol 3 input files by link (stage 3, ADR §8.1)', () => {
+    const FRAMES = { 'b_ch-1_sc-1_iu-0a.png': crypto.randomBytes(40000), 'b_ch-1_sc-1_iu-0b.png': crypto.randomBytes(30000) };
+
+    it('input_files → GET by link with the upload token, into COMFY_INPUT_DIR before /prompt (sha256 ok); removed after the job', async () => {
+        const r = await scenario({ v3: 'task', inputs: FRAMES }, (st, out) => st.puts.length >= 1 && /Done 7c0d9a3e/.test(out), 20000);
+        expect.ok(r.ok, r.out.slice(-1500));
+        expect.equal(r.st.inputGets.length, 2);
+        for (const g of r.st.inputGets) expect.equal(g.auth, `Bearer ${TOKEN}`);
+        expect.deepEqual(r.st.inputsAtPrompt, Object.keys(FRAMES).sort());
+        expect.deepEqual(r.inputsLeft, []);
+        expect.equal(r.st.errors.length, 0);
+    });
+
+    it('input GET 503 → retried, then ok', async () => {
+        const r = await scenario({ v3: 'task', inputs: FRAMES, inputStatuses: [503] }, (st, out) => st.puts.length >= 1 && /Done 7c0d9a3e/.test(out), 20000);
+        expect.ok(r.ok, r.out.slice(-1500));
+        expect.equal(r.st.inputGets.length, 3);
+    });
+
+    it('input GET 409 stale_attempt → job dropped: no prompt, no PUT, no error report', async () => {
+        const r = await scenario({ v3: 'task', inputs: FRAMES, inputStatuses: [409], inputCode: 'stale_attempt' }, (_st, out) => /dropped/.test(out), 20000);
+        expect.ok(r.ok, r.out.slice(-1500));
+        expect.equal(r.st.prompts.length, 0);
+        expect.equal(r.st.puts.length, 0);
+        expect.equal(r.st.errors.length, 0);
+    });
+
+    it('input sha256 mismatch → error report (transient), no prompt, nothing left in COMFY_INPUT_DIR', async () => {
+        const r = await scenario({ v3: 'task', inputs: FRAMES, badSha: true }, (st) => st.errors.length >= 1, 20000);
+        expect.ok(r.ok, r.out.slice(-1500));
+        expect.equal(r.st.prompts.length, 0);
+        expect.equal(r.st.errors[0].body.error_class, 'transient');
+        expect.ok(/sha256 mismatch/.test(r.st.errors[0].body.reason), r.st.errors[0].body.reason);
+        expect.deepEqual(r.inputsLeft, []);
+    });
+
+    it('input 409 input_changed → error report (deterministic), no prompt', async () => {
+        const r = await scenario({ v3: 'task', inputs: FRAMES, inputStatuses: [409], inputCode: 'input_changed' }, (st) => st.errors.length >= 1, 20000);
+        expect.ok(r.ok, r.out.slice(-1500));
+        expect.equal(r.st.prompts.length, 0);
+        expect.equal(r.st.errors[0].body.error_class, 'deterministic');
+    });
+});
+

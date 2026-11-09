@@ -32,6 +32,7 @@ const fsp = require("fs").promises;
 const path = require("path");
 const http = require("http");
 const https = require("https");
+const crypto = require("crypto");
 const { cleanupJobArtifacts } = require("./worker-cleanup.cjs");
 const journal = require("./worker-cleanup-journal.cjs");
 const { loadDotEnv } = require("./worker-env.cjs");
@@ -1118,6 +1119,84 @@ async function sendErrorV3(task, reason, meta = {}) {
   }));
 }
 
+// ======================================================
+// V3 INPUT FILES (2.5.0, ORCHESTRATION_V2 §8.1, stage 3)
+// ======================================================
+// task.input_files = [{name, url, sha256, bytes}]: frames of a video group (and
+// any future input) are fetched by link with the job's upload token — no
+// base64 in the task. Each file lands in COMFY_INPUT_DIR under `name` (the name
+// the workflow's LoadImage nodes use) via a temp file + rename after the sha256
+// and size match; it is removed after the job like the v2 base64 inputs.
+const SAFE_INPUT_NAME = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,200}$/;
+const V3_INPUT_ATTEMPTS = Number(process.env.V3_INPUT_ATTEMPTS) > 0 ? Number(process.env.V3_INPUT_ATTEMPTS) : 3;
+
+function inputError(message, errorClass, extra = {}) {
+  return Object.assign(new Error(message), { errorClass, ...extra });
+}
+
+function httpGetBuffer(urlStr, headers, maxBytes) {
+  return new Promise((resolve, reject) => {
+    const u = new URL(urlStr);
+    const mod = u.protocol === "https:" ? https : http;
+    const req = mod.get(u, { headers }, (res) => {
+      const chunks = [];
+      let size = 0;
+      res.on("data", (c) => {
+        size += c.length;
+        if (size > maxBytes) { req.destroy(new Error(`input larger than ${maxBytes} bytes`)); return; }
+        chunks.push(c);
+      });
+      res.on("end", () => resolve({ status: res.statusCode, body: Buffer.concat(chunks) }));
+      res.on("error", reject);
+    });
+    req.setTimeout(V3_UPLOAD_IDLE_MS, () => req.destroy(new Error(`no progress for ${V3_UPLOAD_IDLE_MS}ms`)));
+    req.on("error", reject);
+  });
+}
+
+/** Download every input of a v3 task into COMFY_INPUT_DIR. → created paths (also journalled). */
+async function fetchInputsV3(task, ctx, created) {
+  const list = Array.isArray(task.input_files) ? task.input_files : [];
+  if (!list.length) return created;
+  await fsp.mkdir(COMFY_INPUT_DIR, { recursive: true });
+  for (const f of list) {
+    const name = f && typeof f.name === "string" ? f.name : "";
+    if (!SAFE_INPUT_NAME.test(name) || name.includes("..")) throw inputError(`bad input name ${JSON.stringify(name)}`, "deterministic");
+    if (typeof f.url !== "string" || !/^https?:\/\//.test(f.url)) throw inputError(`input ${name}: no url`, "deterministic");
+    const want = typeof f.sha256 === "string" ? f.sha256 : null;
+    const maxBytes = Number.isInteger(f.bytes) && f.bytes > 0 ? f.bytes : 256 * 1024 * 1024;
+    let got = null;
+    let delay = V3_DELIVERY_BACKOFF_MS;
+    for (let attempt = 1; attempt <= V3_INPUT_ATTEMPTS; attempt++) {
+      let r = null; let netErr = null;
+      try { r = await httpGetBuffer(f.url, { Authorization: `Bearer ${task.upload_token}` }, maxBytes); } catch (err) { netErr = err; }
+      if (r && r.status === 200) { got = r.body; break; }
+      if (r && r.status < 500) {
+        let code = "";
+        try { code = JSON.parse(r.body.toString("utf8")).code || ""; } catch (_) { /* not json */ }
+        // 409 stale_attempt / 401: the backend no longer wants this attempt → drop the job silently
+        if ((r.status === 409 && code === "stale_attempt") || r.status === 401) throw inputError(`input ${name}: HTTP ${r.status} ${code}`.trim(), "deterministic", { dropJob: true });
+        throw inputError(`input ${name}: HTTP ${r.status} ${code}`.trim(), "deterministic");
+      }
+      const why = r ? `HTTP ${r.status}` : (netErr && netErr.message) || String(netErr);
+      if (attempt === V3_INPUT_ATTEMPTS) throw inputError(`input ${name}: ${why}`, "transient");
+      log("warn", `Input ${name} attempt ${attempt}/${V3_INPUT_ATTEMPTS} failed: ${why} — retry in ${delay}ms`);
+      await sleep(delay);
+      delay = Math.min(delay * 2, 15000);
+    }
+    if (want && crypto.createHash("sha256").update(got).digest("hex") !== want) throw inputError(`input ${name}: sha256 mismatch`, "transient");
+    if (Number.isInteger(f.bytes) && f.bytes > 0 && got.length !== f.bytes) throw inputError(`input ${name}: ${got.length} bytes, expected ${f.bytes}`, "transient");
+    const filePath = path.join(COMFY_INPUT_DIR, name);
+    const tmp = `${filePath}.${process.pid}.part`;
+    created.push(filePath);
+    await journal.addInputFile(ctx, filePath);
+    await fsp.writeFile(tmp, got);
+    await fsp.rename(tmp, filePath);
+    log("info", `Input ready: ${name} (${Math.round(got.length / 1024)}KB, sha256 ok)`);
+  }
+  return created;
+}
+
 function v3TaskProblem(task) {
   if (task.protocol_version !== V3_PROTOCOL_VERSION) return `protocol_version=${task.protocol_version || "missing"}`;
   if (!task.job_id || !Number.isInteger(task.attempt)) return "job_id / attempt missing";
@@ -1143,8 +1222,11 @@ async function runV3Task(task) {
 
   let outputPath = null;
   let delivered = false;
+  const inputFiles = [];
   try {
     await journal.createJob({ jobId, dispatchId, log });
+    // 2.5.0: input files by link (video frames) before the workflow starts
+    await fetchInputsV3(task, { jobId, dispatchId, log }, inputFiles);
     job.promptId = await runWorkflow(task.params);
     if (job.cancelled) {
       await interruptComfy(job.promptId, "cancel");
@@ -1182,6 +1264,9 @@ async function runV3Task(task) {
     if (err && err.cancelled) {
       log("info", `Job ${jobId} stopped: cancelled — no upload, no error report`);
       delivered = true;   // nothing to keep for a cancelled job
+    } else if (err && err.dropJob) {
+      log("warn", `Job ${jobId} dropped: ${err.message} — the backend no longer serves this attempt`);
+      delivered = true;
     } else {
       log("error", `Failed ${jobId}`, err && err.message || err);
       await sendErrorV3(task, err && err.message || err || "worker_error", {
@@ -1193,7 +1278,7 @@ async function runV3Task(task) {
     if (currentV3 === job) currentV3 = null;
     try {
       const toCleanOutput = delivered ? outputPath : null;
-      const cleanupResult = await cleanupJobArtifacts({ inputFiles: [], outputFile: toCleanOutput });
+      const cleanupResult = await cleanupJobArtifacts({ inputFiles, outputFile: toCleanOutput });
       for (const f of cleanupResult.failed) log("warn", `Cleanup ${jobId}: failed to remove ${f.path}: ${f.reason}`);
       if (cleanupResult.failed.length === 0) await journal.removeJob({ jobId, dispatchId, log });
     } catch (cleanupErr) {
