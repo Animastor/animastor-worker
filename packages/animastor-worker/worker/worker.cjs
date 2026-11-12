@@ -230,6 +230,14 @@ async function verifyCredential() {
 // FIND OUTPUT NODES (Save*)
 // ======================================================
 
+// RESULT CONTRACT (relied upon by the backend — animastor-docs
+// architecture/VOICE_REFERENCES.md §«Контракт результата воркера»):
+// a job returns ONE file. For audio it is the first output reported in the
+// ComfyUI history by a node whose class_type starts with "SaveAudio"
+// (ui.audio[0].filename; nodes in workflow-key order). Custom output nodes
+// opt in by their class name — e.g. SaveAudioAnimastorReference
+// (comfyui-nodes/animastor-voice-ref) returns a WAV with a RIFF LIST/INFO
+// JSON chunk. Do not change this selection without updating that document.
 function findOutputNodes(workflow) {
   const result = { image: [], audio: [], video: [] };
 

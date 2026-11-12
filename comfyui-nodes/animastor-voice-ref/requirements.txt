@@ -1,0 +1,5 @@
+# Pinned for the audio/qwen-tts profile (torch 2.10 cu128 → CUDA 12 + cuDNN 9).
+# ctranslate2 4.5+ is the CUDA 12 / cuDNN 9 line. If the GPU path fails on the
+# instance, the node falls back to CPU int8 (device=auto) and records it.
+faster-whisper==1.2.1
+ctranslate2==4.6.0
